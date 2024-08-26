@@ -42,7 +42,7 @@
     ],
     "dependencies": {
         "@langchain/core": "^0.2.27",
-        "langchain": "^0.2.16"
+        "langchain": "^0.2.17"
     },
     "devDependencies": {
         "@types/uuid": "^10.0.0",

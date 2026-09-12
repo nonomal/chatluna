@@ -1,4 +1,4 @@
-import { BaseMessage } from '@langchain/core/messages'
+import { BaseMessage, MessageContentComplex } from '@langchain/core/messages'
 import type { PostHandler } from '../../utils/types'
 
 export interface RawPreset {
@@ -6,7 +6,7 @@ export interface RawPreset {
     prompts: {
         role: 'user' | 'system' | 'assistant'
         type?: 'personality' | 'description' | 'first_message' | 'scenario'
-        content: string
+        content: string | MessageContentComplex[]
     }[]
     format_user_prompt?: string
     world_lores?: (
@@ -47,11 +47,14 @@ export interface RawPreset {
     authors_note?: AuthorsNote
     knowledge?: KnowledgeConfig
     config?: {
+        maxOutputToken?: number
         longMemoryPrompt?: string
         loreBooksPrompt?: string
         longMemoryExtractPrompt?: string
         longMemoryNewQuestionPrompt?: string
         postHandler?: PostHandler
+        reActInstruction?: string
+        enableKeywordTrigger?: boolean
     }
 }
 
@@ -97,11 +100,14 @@ export interface PresetTemplate {
     authorsNote?: AuthorsNote
     knowledge?: KnowledgeConfig
     config: {
+        maxOutputToken?: number
         longMemoryPrompt?: string
         loreBooksPrompt?: string
         longMemoryExtractPrompt?: string
         longMemoryNewQuestionPrompt?: string
         postHandler?: PostHandler
+        reActInstruction?: string
+        enableKeywordTrigger?: boolean
     }
 }
 

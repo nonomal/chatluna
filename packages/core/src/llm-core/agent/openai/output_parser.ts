@@ -5,14 +5,18 @@ import {
     isBaseMessage
 } from '@langchain/core/messages'
 import { ChatGeneration } from '@langchain/core/outputs'
-import { AgentAction, AgentFinish, AgentStep } from '@langchain/core/agents'
-import { OutputParserException } from '@langchain/core/output_parsers'
+import { AgentStep } from '@langchain/core/agents'
 import {
-    AgentActionOutputParser,
-    AgentMultiActionOutputParser,
+    BaseOutputParser,
+    OutputParserException
+} from '@langchain/core/output_parsers'
+import {
+    AgentAction,
+    AgentFinish,
     ChatCompletionMessageFunctionCall,
     ChatCompletionMessageToolCall
 } from '../types'
+import { getMessageContent } from 'koishi-plugin-chatluna/utils/string'
 
 /**
  * Type that represents an agent action with an optional message log.
@@ -21,7 +25,9 @@ export type FunctionsAgentAction = AgentAction & {
     messageLog?: BaseMessage[]
 }
 
-export class OpenAIFunctionsAgentOutputParser extends AgentActionOutputParser {
+export class OpenAIFunctionsAgentOutputParser extends BaseOutputParser<
+    AgentAction | AgentFinish
+> {
     // eslint-disable-next-line @typescript-eslint/naming-convention
     lc_namespace = ['@langchain/core/messages', 'agents', 'openai']
 
@@ -60,35 +66,38 @@ export class OpenAIFunctionsAgentOutputParser extends AgentActionOutputParser {
                 'This agent cannot parse non-string model responses.'
             )
         }
-        if (message.additional_kwargs.function_call) {
-            // eslint-disable-next-line prefer-destructuring, @typescript-eslint/naming-convention
-            const function_call: ChatCompletionMessageFunctionCall =
-                message.additional_kwargs.function_call
-            try {
-                const toolInput = function_call.arguments
-                    ? JSON.parse(function_call.arguments)
-                    : {}
-                return {
-                    tool: function_call.name as string,
-                    toolInput,
-                    log:
-                        message.content?.length > 0
-                            ? (message.content as string)
-                            : `Invoking "${function_call.name}" with ${
-                                  function_call.arguments ?? '{}'
-                              }`,
-                    messageLog: [message]
-                }
-            } catch (error) {
-                throw new OutputParserException(
-                    `Failed to parse function arguments from chat model response. Text: "${function_call.arguments}". ${error}`
-                )
-            }
-        } else {
+
+        const content = getMessageContent(message.content) ?? ''
+
+        // eslint-disable-next-line prefer-destructuring, @typescript-eslint/naming-convention
+        const function_call: ChatCompletionMessageFunctionCall =
+            message.additional_kwargs.function_call
+
+        if (!function_call) {
             return {
-                returnValues: { output: message.content },
-                log: message.content as string
+                returnValues: { output: message.content, message },
+                log: content
             }
+        }
+
+        try {
+            const toolInput = function_call.arguments
+                ? JSON.parse(function_call.arguments)
+                : {}
+            return {
+                tool: function_call.name,
+                toolInput,
+                log:
+                    content?.length > 0
+                        ? content
+                        : `Invoking "${function_call.name}" with ${function_call.arguments ?? '{}'}`,
+                messageLog: [message],
+                content: message.content
+            }
+        } catch (error) {
+            throw new OutputParserException(
+                `Failed to parse function arguments from chat model response. Text: "${function_call.arguments}". ${error}`
+            )
         }
     }
 
@@ -111,7 +120,9 @@ export type ToolsAgentStep = AgentStep & {
     action: ToolsAgentAction
 }
 
-export class OpenAIToolsAgentOutputParser extends AgentMultiActionOutputParser {
+export class OpenAIToolsAgentOutputParser extends BaseOutputParser<
+    AgentAction[] | AgentFinish
+> {
     // eslint-disable-next-line @typescript-eslint/naming-convention
     lc_namespace = ['@langchain/core/messages', 'agents', 'openai']
 
@@ -145,85 +156,86 @@ export class OpenAIToolsAgentOutputParser extends AgentMultiActionOutputParser {
      * @returns A ToolsAgentAction[] or AgentFinish object.
      */
     parseAIMessage(message: BaseMessage): ToolsAgentAction[] | AgentFinish {
-        if (message.content && typeof message.content !== 'string') {
-            throw new Error(
-                'This agent cannot parse non-string model responses.'
+        const content = getMessageContent(message.content)
+        const agentFinish: AgentFinish = {
+            returnValues: { output: message.content, message },
+            log: content ?? ''
+        }
+
+        if (
+            (message instanceof AIMessageChunk ||
+                message instanceof AIMessage) &&
+            message.invalid_tool_calls?.length > 0
+        ) {
+            throw new OutputParserException(
+                `Invalid or incomplete tool call arguments: ${JSON.stringify(message.invalid_tool_calls)}`
             )
         }
 
-        if (message.additional_kwargs.tool_calls) {
-            const toolCalls: ChatCompletionMessageToolCall[] = message
-                .additional_kwargs.tool_calls as ChatCompletionMessageToolCall[]
-            try {
-                return toolCalls.map((toolCall, i) => {
-                    const toolInput = toolCall.function.arguments
-                        ? JSON.parse(toolCall.function.arguments)
-                        : {}
-                    const messageLog = i === 0 ? [message] : []
-                    return {
-                        tool: toolCall.function.name as string,
-                        toolInput,
-                        toolCallId: toolCall.id,
-                        log:
-                            message.content?.length > 0
-                                ? (message.content as string)
-                                : `Invoking "${toolCall.function.name}" with ${
-                                      toolCall.function.arguments ?? '{}'
-                                  }`,
-                        messageLog
-                    }
-                })
-            } catch (error) {
-                throw new OutputParserException(
-                    `Failed to parse tool arguments from chat model response. Text: "${JSON.stringify(
-                        toolCalls
-                    )}". ${error}`
-                )
-            }
-        } else if (
+        if (
             (message instanceof AIMessageChunk ||
                 message instanceof AIMessage) &&
-            message.tool_calls != null
+            message.tool_calls?.length > 0
         ) {
             const toolCalls = message.tool_calls
-
-            if (toolCalls.length < 1) {
-                return {
-                    returnValues: { output: message.content },
-                    log: message.content as string
-                }
-            }
-
             try {
                 return toolCalls.map((toolCall, i) => {
-                    const toolInput = toolCall.args
-                    const messageLog = i === 0 ? [message] : []
                     return {
-                        tool: toolCall.name as string,
-                        toolInput,
+                        tool: toolCall.name,
+                        toolInput: toolCall.args,
                         toolCallId: toolCall.id,
                         log:
-                            message.content?.length > 0
-                                ? (message.content as string)
-                                : `Invoking "${toolCall.name}" with ${
-                                      JSON.stringify(toolCall.args) ?? '{}'
-                                  }`,
-                        messageLog
+                            content?.length > 0
+                                ? content
+                                : `Invoking "${toolCall.name}" with ${JSON.stringify(toolCall.args) ?? '{}'}`,
+                        messageLog: i === 0 ? [message] : [],
+                        content: i === 0 ? message.content : undefined,
+                        reasoningContent:
+                            i === 0
+                                ? (message.additional_kwargs
+                                      ?.reasoning_content as string | undefined)
+                                : undefined
                     }
                 })
             } catch (error) {
                 throw new OutputParserException(
-                    `Failed to parse tool arguments from chat model response. Text: "${JSON.stringify(
-                        toolCalls
-                    )}". ${error}`
+                    `Failed to parse tool arguments from chat model response. Text: "${JSON.stringify(toolCalls)}". ${error}`
                 )
             }
-        } else {
-            return {
-                returnValues: { output: message.content },
-                log: message.content as string
+        }
+
+        const { tool_calls: rawToolCalls } = message.additional_kwargs
+        if (Array.isArray(rawToolCalls) && rawToolCalls.length > 0) {
+            const toolCalls = rawToolCalls as ChatCompletionMessageToolCall[]
+            try {
+                return toolCalls.map((toolCall, i) => {
+                    return {
+                        tool: toolCall.function.name,
+                        toolInput: toolCall.function.arguments
+                            ? JSON.parse(toolCall.function.arguments)
+                            : {},
+                        toolCallId: toolCall.id,
+                        log:
+                            content?.length > 0
+                                ? content
+                                : `Invoking "${toolCall.function.name}" with ${toolCall.function.arguments ?? '{}'}`,
+                        messageLog: i === 0 ? [message] : [],
+                        content: i === 0 ? message.content : undefined,
+                        reasoningContent:
+                            i === 0
+                                ? (message.additional_kwargs
+                                      ?.reasoning_content as string | undefined)
+                                : undefined
+                    }
+                })
+            } catch (error) {
+                throw new OutputParserException(
+                    `Failed to parse tool arguments from chat model response. Text: "${JSON.stringify(toolCalls)}". ${error}`
+                )
             }
         }
+
+        return agentFinish
     }
 
     getFormatInstructions(): string {

@@ -1,0 +1,18 @@
+$inner:
+    - {}
+    - $desc: Request Options
+      apiURL:
+          $desc: Dify API backend address
+      enableFileUpload:
+          $desc: Enable Dify local_file uploads; disable to skip uploads and files payload
+      additionalModels:
+          $desc: Dify workflow list
+          $inner:
+              apiKey: API Key
+              workflowName: Workflow Name
+              workflowType: Node Type
+              enabled: Enabled
+
+    - $desc: Model Configuration
+      maxContextRatio: 'Maximum context usage ratio (0-1). Controls the maximum percentage of model context window available for use. For example, 0.35 means at most 35% of the model context can be used.'
+      temperature: 'Sampling temperature. Higher values increase randomness.'

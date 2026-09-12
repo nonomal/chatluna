@@ -1,0 +1,28 @@
+$inner:
+    - $desc: 上下文图像描述服务设置
+      enableContextImageDescription: '是否为上下文中的图像使用图像描述服务生成并注入文本描述。仅当前模型不支持图像输入时生效。'
+      enableContextGifHandling: '是否为上下文中的 GIF 使用图像描述服务生成并注入文本描述。关闭后 GIF 将被从上下文中移除。'
+
+    - $desc: 文件读取/描述工具设置
+      enableImageReadTool: '启用 read_files 工具的图像读取/描述功能（非 GIF），若当前模型不支持图像输入，则会使用图像描述模型生成描述。若当前模型支持图像输入，建议只保留这一个图像读取工具开启，因为它能使模型自己看见图像内容，比图像描述更加精确。'
+      enableGifReadTool: '启用 read_files 工具的 GIF 描述功能。'
+      enableFileReadTool: '启用 read_files 工具的通用文件读取功能（支持纯文本、PDF、JSON、音频、视频等，具体取决于模型能力）。若模型不支持该文件类型输入，则会返回报错。'
+
+    - $desc: 音频转换设置
+      enableAudioFfmpegConversion: '启用不支持音频格式的 ffmpeg 转换（仅当当前模型不原生支持该音频格式时，才会先转码为 MP3 再注入，主要针对语音消息）。需要安装并启用 koishi-plugin-ffmpeg-path；其中官方 Bot 的 silk 语音依赖 koishi-plugin-ffmpeg-path 2.0.0 及以上版本提供的 silk 服务。'
+
+    - $desc: 文件读取设置
+      fileInsertPrompt: 文件内容注入到上下文时的提示词。在注入的文件内容前面追加此提示词，用于引导模型结合文件内容回答问题。
+
+    - $desc: 图像描述服务设置
+      imageModel: '选择支持图像输入的模型以生成图像描述（如 `gemini-3-flash-preview`、`qwen3.5-flash`、`doubao-seed-2.0-lite`）'
+      imagePrompt: 图像输入的系统提示词。
+      imageInsertPrompt: 图像描述插入到具体消息里的提示词。
+      gifStrategy:
+          $desc: GIF 图像帧提取策略
+          $inner:
+              - 只获取第一帧
+              - 获取前 N 帧
+              - 平均获取 N 帧
+
+      gifFrameCount: 提取的帧数（仅在选择"前 N 帧"或"平均 N 帧"策略时有效）

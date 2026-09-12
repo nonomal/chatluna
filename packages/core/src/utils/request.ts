@@ -20,7 +20,7 @@ function createProxyAgentForFetch(
     init: fetchType.RequestInit,
     proxyAddress: string
 ): fetchType.RequestInit {
-    if (init.dispatcher || globalProxyAddress == null) {
+    if (init.dispatcher || proxyAddress == null) {
         return init
     }
 
@@ -77,13 +77,17 @@ function createProxyAgent(
 export let globalProxyAddress: string | null = global['globalProxyAddress']
 
 export function setGlobalProxyAddress(address: string) {
+    if (!address?.trim()) {
+        logger?.warn('Global proxy address is empty, using no proxy')
+        return
+    }
     if (address.match(/^socks/) || address.match(/^https?:\/\//)) {
         globalProxyAddress = address
         global['globalProxyAddress'] = address
     } else {
         throw new ChatLunaError(
             ChatLunaErrorCode.UNSUPPORTED_PROXY_PROTOCOL,
-            new Error('Unsupported proxy protocol')
+            new Error('Unsupported proxy protocol. Try add http:// or socks')
         )
     }
 }
@@ -97,7 +101,11 @@ export function chatLunaFetch(
     init?: fetchType.RequestInit,
     proxyAddress: string = globalProxyAddress
 ) {
-    if (proxyAddress !== 'null' && proxyAddress != null && !init?.dispatcher) {
+    if (
+        proxyAddress !== 'null' &&
+        proxyAddress != null &&
+        init?.['dispatcher'] == null
+    ) {
         init = createProxyAgentForFetch(init || {}, proxyAddress)
     }
 
@@ -119,7 +127,11 @@ export function ws(
     options?: ClientOptions | ClientRequestArgs,
     proxyAddress: string = globalProxyAddress
 ) {
-    if (proxyAddress !== 'null' && proxyAddress != null && !options?.agent) {
+    if (
+        proxyAddress !== 'null' &&
+        proxyAddress != null &&
+        options?.agent == null
+    ) {
         options = options || {}
         options.agent = createProxyAgent(proxyAddress)
     }
@@ -234,8 +246,6 @@ function parseSocksURL(url: URL): { shouldLookup: boolean; proxy: SocksProxy } {
             enumerable: false
         })
     }
-
-    console.log(proxy)
 
     return { shouldLookup: lookup, proxy }
 }

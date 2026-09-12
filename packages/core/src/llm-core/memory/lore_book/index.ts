@@ -9,16 +9,16 @@ import {
 export function apply(ctx: Context, config: Config): void {
     const cache = new Map<PresetTemplate, LoreBookMatcher>()
 
-    ctx.on(
-        'chatluna/before-chat',
+    ctx.before(
+        'chatluna/chat',
         async (
             conversationId,
             message,
-            promptVariables,
+            _promptVariables,
             chatInterface,
             chain
         ) => {
-            const preset = await chatInterface.preset
+            const preset = chatInterface.preset.value
 
             if (!preset.loreBooks || preset.loreBooks.items.length === 0) {
                 return
@@ -35,7 +35,9 @@ export function apply(ctx: Context, config: Config): void {
                 cache.set(preset, matcher)
             }
 
-            const messages = await chatInterface.chatHistory.getMessages()
+            const messages = [
+                ...(await chatInterface.chatHistory.getMessages())
+            ]
 
             messages.push(message)
 
@@ -47,17 +49,34 @@ export function apply(ctx: Context, config: Config): void {
                         matchedLores.map((lore) => lore.keywords)
                     )}`
                 )
-                promptVariables['lore_books'] = matchedLores
+
+                ctx.chatluna.contextManager.inject({
+                    conversationId,
+                    name: 'lore_books',
+                    value: matchedLores,
+                    once: true
+                })
             }
         }
     )
 
-    ctx.on(
-        'chatluna/clear-chat-history',
-        async (conversationId, chatInterface) => {
-            cache.clear()
-        }
-    )
+    const clear = (conversationId: string) => {
+        cache.clear()
+        ctx.chatluna.contextManager.clearConversation(conversationId)
+    }
+
+    ctx.on('chatluna/after-conversation-clear-history', async (payload) => {
+        clear(payload.conversation.id)
+    })
+    ctx.on('chatluna/after-conversation-archive', async (payload) => {
+        clear(payload.conversation.id)
+    })
+    ctx.on('chatluna/after-conversation-restore', async (payload) => {
+        clear(payload.conversation.id)
+    })
+    ctx.on('chatluna/after-conversation-delete', async (payload) => {
+        clear(payload.conversation.id)
+    })
 }
 
 export class LoreBookMatcher {

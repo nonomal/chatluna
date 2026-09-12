@@ -3,6 +3,8 @@ import {
     AIMessageChunk,
     BaseMessage,
     FunctionMessage,
+    HumanMessage,
+    MessageContentComplex,
     ToolMessage
 } from '@langchain/core/messages'
 import { BaseOutputParser } from '@langchain/core/output_parsers'
@@ -12,8 +14,13 @@ import {
     RunnableSequence
 } from '@langchain/core/runnables'
 import { StructuredTool } from '@langchain/core/tools'
-import { AgentAction, AgentFinish, AgentStep } from '@langchain/core/agents'
-import { ChatLunaChatPrompt } from 'koishi-plugin-chatluna/llm-core/chain/prompt'
+import {
+    AgentAction,
+    AgentFinish,
+    AgentObservation,
+    AgentStep,
+    ScratchpadEntry
+} from '../types'
 import type { ChatLunaChatModel } from '../../platform/model'
 import {
     FunctionsAgentAction,
@@ -21,6 +28,9 @@ import {
     OpenAIToolsAgentOutputParser,
     ToolsAgentAction
 } from './output_parser'
+import { BaseChatPromptTemplate } from '@langchain/core/prompts'
+import { getMessageContent } from 'koishi-plugin-chatluna/utils/string'
+import { observationToMessageContent } from '../legacy-executor'
 
 /**
  * Checks if the given action is a FunctionsAgentAction.
@@ -42,16 +52,30 @@ function isToolsAgentAction(
 // eslint-disable-next-line @typescript-eslint/naming-convention
 function _convertAgentStepToMessages(
     action: AgentAction | FunctionsAgentAction | ToolsAgentAction,
-    observation: string
+    observation: AgentObservation
 ) {
     if (isToolsAgentAction(action) && action.toolCallId !== undefined) {
         const log = action.messageLog as BaseMessage[]
-        if (observation.length < 1) {
-            observation = `The tool ${action.tool} returned no output.`
+        const content = observationToMessageContent(observation)
+        if (
+            content === observation &&
+            (content.length < 1 || content === 'null')
+        ) {
+            return log.concat(
+                new ToolMessage({
+                    content:
+                        `The tool '${action.tool}' returned no output. ` +
+                        'Do not call this tool with the exact same input ' +
+                        'again. Change strategy, use different arguments, ' +
+                        'or finish with a blocker summary.',
+                    name: action.tool,
+                    tool_call_id: action.toolCallId
+                })
+            )
         }
         return log.concat(
             new ToolMessage({
-                content: observation,
+                content,
                 name: action.tool,
                 tool_call_id: action.toolCallId
             })
@@ -61,20 +85,61 @@ function _convertAgentStepToMessages(
         action.messageLog !== undefined
     ) {
         return action.messageLog?.concat(
-            new FunctionMessage(observation, action.tool)
+            new FunctionMessage(
+                getMessageContent(observation as BaseMessage['content']),
+                action.tool
+            )
         )
     } else {
         return [new AIMessage(action.log)]
     }
 }
 
+function mergeHumanMessages(messages: HumanMessage[]) {
+    if (messages.length === 1) {
+        return messages[0]
+    }
+
+    const base = messages[0]
+    const content: MessageContentComplex[] = []
+
+    for (const msg of messages) {
+        if (content.length > 0) {
+            content.push({ type: 'text', text: '\n' })
+        }
+
+        if (typeof msg.content === 'string') {
+            content.push({ type: 'text', text: msg.content })
+            continue
+        }
+
+        content.push(...msg.content)
+    }
+
+    return new HumanMessage({
+        content,
+        name: base.name,
+        id: base.id,
+        additional_kwargs: messages.reduce(
+            (acc, msg) => Object.assign(acc, msg.additional_kwargs),
+            Object.assign({}, base.additional_kwargs)
+        )
+    })
+}
+
 // eslint-disable-next-line @typescript-eslint/naming-convention
 export function _formatIntermediateSteps(
-    intermediateSteps: AgentStep[]
+    intermediateSteps: ScratchpadEntry[]
 ): BaseMessage[] {
-    return intermediateSteps.flatMap(({ action, observation }) =>
-        _convertAgentStepToMessages(action, observation)
-    )
+    return intermediateSteps.flatMap((step) => {
+        if ('messages' in step) {
+            return step.messages.length > 0
+                ? [mergeHumanMessages(step.messages)]
+                : []
+        }
+
+        return _convertAgentStepToMessages(step.action, step.observation)
+    })
 }
 
 /**
@@ -90,7 +155,7 @@ export type CreateOpenAIAgentParams = {
     /** Tools this agent has access to. */
     tools: StructuredTool[]
     /** The prompt to use, must have an input key for `agent_scratchpad`. */
-    prompt: ChatLunaChatPrompt
+    prompt: BaseChatPromptTemplate
 }
 
 export function createOpenAIAgent({
@@ -98,7 +163,7 @@ export function createOpenAIAgent({
     tools,
     prompt
 }: CreateOpenAIAgentParams) {
-    const llmWithTools = llm.bind({
+    const llmWithTools = llm.withConfig({
         tools
     })
 
@@ -109,8 +174,11 @@ export function createOpenAIAgent({
     const agent = RunnableSequence.from([
         RunnablePassthrough.assign({
             // eslint-disable-next-line @typescript-eslint/naming-convention
-            agent_scratchpad: (input: { steps: AgentStep[] }) =>
-                _formatIntermediateSteps(input.steps)
+            agent_scratchpad: (input: {
+                steps: AgentStep[]
+                scratchpadEntries?: ScratchpadEntry[]
+            }) =>
+                _formatIntermediateSteps(input.scratchpadEntries ?? input.steps)
             /* // @ts-expect-error eslint-disable-next-line @typescript-eslint/naming-convention
             input_text: (input: { input: BaseMessage[] }) =>
                 getMessageContent(input.input[0].content) */
@@ -118,24 +186,39 @@ export function createOpenAIAgent({
         prompt,
         llmWithTools,
         RunnableLambda.from((input: BaseMessage) => {
+            if (input == null) {
+                return [
+                    {
+                        tool: '_Exception',
+                        toolInput: 'Something unknown error. Please try again.',
+                        log: 'Input is null'
+                    }
+                ]
+            }
+
+            const hasTools =
+                input.additional_kwargs?.tool_calls?.length > 0 ||
+                ((input instanceof AIMessageChunk ||
+                    input instanceof AIMessage) &&
+                    input.tool_calls?.length > 0)
+            const hasFunction = input.additional_kwargs?.function_call != null
+
             if (
-                (input?.additional_kwargs?.tool_calls ||
-                    ((input instanceof AIMessageChunk ||
-                        input instanceof AIMessage) &&
-                        input.tool_calls)) &&
+                hasTools &&
                 outputParser instanceof OpenAIFunctionsAgentOutputParser
             ) {
                 outputParser = new OpenAIToolsAgentOutputParser()
             } else if (
-                input?.additional_kwargs?.function_call &&
+                hasFunction &&
                 outputParser instanceof OpenAIToolsAgentOutputParser
             ) {
                 outputParser = new OpenAIFunctionsAgentOutputParser()
             }
+
             return outputParser.parseResult([
                 {
                     message: input,
-                    text: input.content as string
+                    text: getMessageContent(input.content)
                 }
             ])
         })

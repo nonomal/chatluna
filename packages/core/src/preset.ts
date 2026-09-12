@@ -2,6 +2,7 @@ import fs from 'fs/promises'
 import { watch } from 'fs'
 import { Context, Logger, Schema } from 'koishi'
 import {
+    EMPTY_PRESET,
     loadPreset,
     PresetTemplate
 } from 'koishi-plugin-chatluna/llm-core/prompt'
@@ -10,25 +11,27 @@ import {
     ChatLunaErrorCode
 } from 'koishi-plugin-chatluna/utils/error'
 import { createLogger } from 'koishi-plugin-chatluna/utils/logger'
+import { ObjectLock } from 'koishi-plugin-chatluna/utils/lock'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { Cache } from './cache'
 import { Config } from './config'
-import md5 from 'md5'
+import { computed, ComputedRef, shallowRef } from '@vue/reactivity'
+import { createHash } from 'crypto'
 
 let logger: Logger
 
 export class PresetService {
-    private readonly _presets: PresetTemplate[] = []
+    private readonly _presets = shallowRef<PresetTemplate[]>([])
 
     private _aborter: AbortController
+    private _lock: ObjectLock
 
     constructor(
         private readonly ctx: Context,
-        private readonly config: Config,
-        private readonly cache: Cache<'chathub/keys', string>
+        private readonly config: Config
     ) {
         logger = createLogger(ctx)
+        this._lock = new ObjectLock()
 
         ctx.on('dispose', () => {
             this._aborter?.abort()
@@ -36,42 +39,87 @@ export class PresetService {
     }
 
     async loadPreset(file: string) {
-        const rawText = await fs.readFile(file, 'utf-8')
-        try {
-            const preset = loadPreset(rawText)
+        if (!file || !file.length) {
+            logger.warn(`Preset file is empty`)
+            return
+        }
 
-            preset.path = file
-            this._presets.push(preset)
-        } catch (e) {
-            logger.error(`error when load preset ${file}`, e)
+        if (!this.ctx.scope.isActive) {
+            return
+        }
+
+        if (this._presets.value.some((p) => p.path === file)) {
+            logger.warn(`Preset ${file} already exists`)
+            return
+        }
+
+        const preset = await this._loadPresetFromPath(file)
+        if (preset) {
+            this._presets.value = [...this._presets.value, preset]
         }
     }
 
-    async loadAllPreset() {
-        await this._checkPresetDir()
-
-        const presetDir = this.resolvePresetDir()
-        const files = await fs.readdir(presetDir)
-
-        this._presets.length = 0
-
-        for (const file of files) {
-            // use file
-            const extension = path.extname(file)
-            if (extension !== '.txt' && extension !== '.yml') {
-                continue
+    private async _loadPresetFromPath(
+        filePath: string
+    ): Promise<PresetTemplate | null> {
+        try {
+            const rawText = await fs.readFile(filePath, 'utf-8')
+            const preset = loadPreset(rawText)
+            if (preset === EMPTY_PRESET) {
+                logger.warn(`Preset ${filePath} is empty, skip`)
+                return null
             }
-            await this.loadPreset(path.join(presetDir, file))
+            preset.path = filePath
+            return preset
+        } catch (e) {
+            logger.error(`Error when load preset ${filePath}`, e)
+            return null
         }
+    }
 
-        this.ctx.schema.set(
-            'preset',
-            Schema.union(
-                this._presets.map((preset) =>
-                    Schema.const(preset.triggerKeyword[0])
-                )
-            )
+    private _updatePreset(preset: PresetTemplate) {
+        const index = this._presets.value.findIndex(
+            (p) => p.path === preset.path
         )
+        if (index !== -1) {
+            const newPresets = [...this._presets.value]
+            newPresets[index] = preset
+            this._presets.value = newPresets
+        } else {
+            this._presets.value = [...this._presets.value, preset]
+        }
+    }
+
+    private _removePreset(filePath: string) {
+        this._presets.value = this._presets.value.filter(
+            (p) => p.path !== filePath
+        )
+    }
+
+    async loadAllPreset() {
+        await this._lock.runLocked(async () => {
+            await this._checkPresetDir()
+
+            const presetDir = this.resolvePresetDir()
+            const files = await fs.readdir(presetDir)
+
+            const presets: PresetTemplate[] = []
+
+            for (const file of files) {
+                const extension = path.extname(file)
+                if (extension !== '.txt' && extension !== '.yml') {
+                    continue
+                }
+                const presetPath = path.join(presetDir, file)
+                const preset = await this._loadPresetFromPath(presetPath)
+                if (preset) {
+                    presets.push(preset)
+                }
+            }
+
+            this._presets.value = presets
+            this._updateSchema()
+        })
     }
 
     watchPreset() {
@@ -96,6 +144,11 @@ export class PresetService {
                     return
                 }
 
+                const ext = path.extname(filename)
+                if (ext !== '.txt' && ext !== '.yml') {
+                    return
+                }
+
                 if (fsWait) return
                 fsWait = setTimeout(() => {
                     fsWait = false
@@ -107,59 +160,39 @@ export class PresetService {
                     const fileStat = await fs.stat(filePath)
                     if (fileStat.isDirectory()) return
 
-                    // Handle file deletion
-                    if (event === 'rename' && !fileStat) {
-                        const index = this._presets.findIndex(
-                            (p) => p.path === filePath
-                        )
-                        if (index !== -1) {
-                            this._presets.splice(index, 1)
-                            md5Cache.delete(filePath)
-                            logger.debug(`removed preset: ${filename}`)
-                            return
-                        }
-                    }
-
-                    // Check if file content changed
-                    const md5Current = md5(await fs.readFile(filePath))
+                    const md5Current = createHash('md5')
+                        .update(await fs.readFile(filePath))
+                        .digest('hex')
                     if (md5Current === md5Cache.get(filePath)) return
 
                     md5Cache.set(filePath, md5Current)
 
-                    // Update or add the preset
-                    const index = this._presets.findIndex(
-                        (p) => p.path === filePath
-                    )
-                    if (index !== -1) {
-                        // Update existing preset
-                        const preset = loadPreset(
-                            await fs.readFile(filePath, 'utf-8')
-                        )
-                        preset.path = filePath
-                        this._presets[index] = preset
-                        logger.debug(`updated preset: ${filename}`)
+                    const preset = await this._loadPresetFromPath(filePath)
+                    if (preset) {
+                        this._updatePreset(preset)
+                        logger.debug(`Updated/Added preset: ${filename}`)
                     } else {
-                        // Add new preset
-                        await this.loadPreset(filePath)
-                        logger.debug(`added new preset: ${filename}`)
+                        this._removePreset(filePath)
+                        logger.debug(`Removed preset: ${filename}`)
+                    }
+                    this._updateSchema()
+                } catch (e) {
+                    if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+                        this._removePreset(filePath)
+                        md5Cache.delete(filePath)
+
+                        if (event === 'rename') {
+                            logger.debug(`Removed preset: ${filename}`)
+                            this._updateSchema()
+                        }
+
+                        return
                     }
 
-                    // Update schema after changes
-                    this.ctx.schema.set(
-                        'preset',
-                        Schema.union(
-                            this._presets.map((preset) =>
-                                Schema.const(preset.triggerKeyword[0])
-                            )
-                        )
-                    )
-                } catch (e) {
                     logger.error(
-                        `error when watching preset file ${filePath}`,
+                        `Error when watching preset file ${filePath}`,
                         e
                     )
-
-                    // trigger full reload
                     await this.loadAllPreset()
                 }
             }
@@ -171,71 +204,115 @@ export class PresetService {
         this.watchPreset()
     }
 
-    async getPreset(
+    getPreset(
         triggerKeyword: string,
-        loadForDisk: boolean = false,
         throwError: boolean = true
-    ): Promise<PresetTemplate> {
-        if (loadForDisk) {
-            // always load for disk
-            await this.loadAllPreset()
-        }
-
-        const preset = this._presets.find((preset) =>
-            preset.triggerKeyword.includes(triggerKeyword)
-        )
-
-        if (preset) {
-            return preset
-        }
-
-        if (throwError) {
-            throw new ChatLunaError(
-                ChatLunaErrorCode.PREST_NOT_FOUND,
-                new Error(`No preset found for keyword ${triggerKeyword}`)
+    ): ComputedRef<PresetTemplate> {
+        return computed(() => {
+            const preset = this._presets.value.find((preset) =>
+                preset.triggerKeyword.includes(triggerKeyword)
             )
-        }
 
-        return undefined
+            if (preset) {
+                return preset
+            }
+
+            if (throwError) {
+                throw new ChatLunaError(
+                    ChatLunaErrorCode.PRESET_NOT_FOUND,
+                    new Error(`No preset found for keyword ${triggerKeyword}`)
+                )
+            }
+
+            return undefined
+        })
     }
 
-    async getDefaultPreset(): Promise<PresetTemplate> {
-        if (this._presets.length === 0) {
-            await this.loadAllPreset()
-        }
+    getDefaultPreset(): ComputedRef<PresetTemplate> {
+        return computed(() => {
+            const preset = this._presets.value.find((preset) =>
+                preset.triggerKeyword.includes('sydney')
+            )
 
-        const preset = this._presets.find((preset) =>
-            preset.triggerKeyword.includes('chatgpt')
+            if (preset) {
+                return preset
+            }
+
+            if (this._presets.value.length === 0) {
+                throw new ChatLunaError(
+                    ChatLunaErrorCode.PRESET_NOT_FOUND,
+                    new Error('No presets loaded. Please call init() first.')
+                )
+            }
+
+            return this._presets.value[0]
+        })
+    }
+
+    getKeywordTriggerAliases(): ComputedRef<string[]> {
+        return computed(() => {
+            if (!this.config.enablePresetKeywordTrigger) {
+                return []
+            }
+
+            return this._presets.value
+                .filter(
+                    (preset) => preset.config.enableKeywordTrigger !== false
+                )
+                .flatMap((preset) =>
+                    preset.triggerKeyword.flatMap((keyword) =>
+                        keyword
+                            .split(',')
+                            .map((item) => item.trim())
+                            .filter((item) => item.length > 0)
+                    )
+                )
+        })
+    }
+
+    getAllPreset(concatKeyword: boolean = true): ComputedRef<string[]> {
+        return computed(() =>
+            this._presets.value.map((preset) =>
+                concatKeyword
+                    ? preset.triggerKeyword.join(', ')
+                    : preset.triggerKeyword[0]
+            )
         )
+    }
 
-        if (preset) {
-            // await this.cache.set('default-preset', 'chatgpt')
-            return preset
-        } else {
-            await this._copyDefaultPresets()
-            return this.getDefaultPreset()
+    addPreset(preset: PresetTemplate) {
+        if (
+            this._presets.value.some(
+                (p) =>
+                    p.triggerKeyword.join(',') ===
+                    preset.triggerKeyword.join(',')
+            ) ||
+            this._presets.value.some((p) => p.path === preset.path)
+        ) {
+            logger.warn(`Preset ${preset.path} already exists`)
+            return
         }
 
-        // throw new Error("No default preset found")
+        this._presets.value = [...this._presets.value, preset]
+        this._updateSchema()
     }
 
-    async getAllPreset(concatKeyword: boolean = true): Promise<string[]> {
-        await this.loadAllPreset()
+    private _updateSchema() {
+        if (!this.ctx.scope.isActive) {
+            return
+        }
 
-        return this._presets.map((preset) =>
-            concatKeyword
-                ? preset.triggerKeyword.join(', ')
-                : preset.triggerKeyword[0]
+        this.ctx.schema.set(
+            'preset',
+            Schema.union(
+                this._presets.value.map((preset) =>
+                    Schema.const(preset.triggerKeyword[0])
+                )
+            )
         )
-    }
-
-    async addPreset(preset: PresetTemplate): Promise<void> {
-        this._presets.push(preset)
     }
 
     async resetDefaultPreset(): Promise<void> {
-        await this.cache.delete('default-preset')
-
         await this._copyDefaultPresets()
     }
 
@@ -250,7 +327,7 @@ export class PresetService {
         try {
             await fs.access(presetDir)
         } catch (err) {
-            if (err.code === 'ENOENT') {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
                 await fs.mkdir(presetDir, { recursive: true })
                 await this._copyDefaultPresets()
             } else {

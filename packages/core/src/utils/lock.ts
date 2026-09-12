@@ -1,4 +1,6 @@
-import { Time } from 'koishi'
+import { withResolver } from 'koishi-plugin-chatluna/utils/promise'
+
+const TIME_MINUTE = 60 * 1000
 
 export class ObjectLock {
     private _lock: boolean = false
@@ -9,7 +11,7 @@ export class ObjectLock {
 
     private readonly _timeout: number
 
-    constructor(timeout = Time.minute * 3) {
+    constructor(timeout = TIME_MINUTE * 3) {
         this._timeout = timeout
     }
 
@@ -24,25 +26,38 @@ export class ObjectLock {
         }
 
         if (this._lock) {
-            return new Promise((resolve, reject) => {
-                const timeoutId = setTimeout(() => {
-                    const index = this._queue.findIndex(
-                        (q) => q.resolve === resolve
-                    )
-                    if (index !== -1) {
-                        this._queue.splice(index, 1)
-                    }
-                    reject(new Error(`Lock timeout after ${this._timeout}ms`))
-                }, this._timeout)
+            // Use call stack to get the error
+            let error: Error | null = null
 
-                this._queue.push({
-                    resolve: (unlockFn) => {
-                        clearTimeout(timeoutId)
-                        resolve(unlockFn)
-                    },
-                    reject
-                })
+            try {
+                throw new Error(`Lock timeout after ${this._timeout}ms`)
+            } catch (e) {
+                error = e as Error
+            }
+
+            const { promise, resolve, reject } = withResolver<() => void>()
+
+            const timeoutId = setTimeout(() => {
+                const index = this._queue.findIndex(
+                    (q) => q.resolve === resolve
+                )
+                if (index !== -1) {
+                    this._queue.splice(index, 1)
+                }
+                reject(
+                    error ?? new Error(`Lock timeout after ${this._timeout}ms`)
+                )
+            }, this._timeout)
+
+            this._queue.push({
+                resolve: (unlockFn) => {
+                    clearTimeout(timeoutId)
+                    resolve(unlockFn)
+                },
+                reject
             })
+
+            return promise
         }
 
         this._lock = true

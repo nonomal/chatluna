@@ -1,0 +1,196 @@
+import type { StructuredTool } from '@langchain/core/tools'
+import { PromptTemplate } from '@langchain/core/prompts'
+import { BaseMessage } from '@langchain/core/messages'
+import {
+    RunnableLambda,
+    RunnablePassthrough,
+    RunnableSequence
+} from '@langchain/core/runnables'
+import { ReActMultiInputOutputParser } from './output_parser'
+import { renderTextDescriptionAndArgs } from '../render'
+import { FORMAT_INSTRUCTIONS } from './prompt'
+import type { AgentStep, ScratchpadEntry } from '../types'
+import type { ChatLunaChatModel } from '../../platform/model'
+import type { ChatLunaChatPrompt } from '../../chain/prompt'
+import { getMessageContent } from 'koishi-plugin-chatluna/utils/string'
+
+/**
+ * Params used by the createXmlAgent function.
+ */
+export type CreateReactAgentParams = {
+    /** LLM to use for the agent. */
+    llm: ChatLunaChatModel
+    /** Tools this agent has access to. */
+    tools: StructuredTool[]
+    /**
+     * The prompt to use. Must have input keys for
+     * `tools`, `tool_names`, and `agent_scratchpad`.
+     */
+    prompt: ChatLunaChatPrompt
+    /**
+     * Whether to invoke the underlying model in streaming mode,
+     * allowing streaming of intermediate steps. Defaults to true.
+     */
+    streamRunnable?: boolean
+
+    instructions?: string
+
+    /**
+     * Whether to use XML format for tool descriptions. Defaults to false.
+     */
+    useXmlFormat?: boolean
+}
+
+/**
+ * Create an agent that uses ReAct prompting.
+ * @param params Params required to create the agent. Includes an LLM, tools, and prompt.
+ * @returns A runnable sequence representing an agent. It takes as input all the same input
+ *     variables as the prompt passed in does. It returns as output either an
+ *     AgentAction or AgentFinish.
+ *
+ * @example
+ * ```typescript
+ * import { AgentExecutor, createReactAgent } from "langchain/agents";
+ * import { pull } from "langchain/hub";
+ * import type { PromptTemplate } from "@langchain/core/prompts";
+ *
+ * import { OpenAI } from "@langchain/openai";
+ *
+ * // Define the tools the agent will have access to.
+ * const tools = [...];
+ *
+ * // Get the prompt to use - you can modify this!
+ * // If you want to see the prompt in full, you can at:
+ * // https://smith.langchain.com/hub/hwchase17/react
+ * const prompt = await pull<PromptTemplate>("hwchase17/react");
+ *
+ * const llm = new OpenAI({
+ *   temperature: 0,
+ * });
+ *
+ * const agent = createReactAgent({
+ *   llm,
+ *   tools,
+ *   prompt,
+ * });
+ *
+ * const agentExecutor = new AgentExecutor({
+ *   agent,
+ *   tools,
+ * });
+ *
+ * const result = await agentExecutor.invoke({
+ *   input: "what is LangChain?",
+ * });
+ * ```
+ */
+export function createReactAgent({
+    llm,
+    tools,
+    prompt,
+    instructions
+}: CreateReactAgentParams) {
+    const toolNames = tools.map((tool) => tool.name)
+
+    // Choose the appropriate renderer based on format preference
+    const toolDescriptions = renderTextDescriptionAndArgs(tools)
+    const outputParser = new ReActMultiInputOutputParser({
+        toolNames
+    })
+
+    const instructionsFormat = PromptTemplate.fromTemplate(
+        instructions ?? FORMAT_INSTRUCTIONS
+    ).format({
+        tool_descriptions: toolDescriptions,
+        tool_names: toolNames.join(', ')
+    })
+
+    prompt = prompt.partialSync({
+        instructions: () => instructionsFormat
+    })
+
+    const agent = RunnableSequence.from(
+        [
+            RunnablePassthrough.assign({
+                // eslint-disable-next-line @typescript-eslint/naming-convention
+                agent_scratchpad: (input: {
+                    steps: AgentStep[]
+                    scratchpadEntries?: ScratchpadEntry[]
+                }) => formatLogToString(input.scratchpadEntries ?? input.steps)
+            }),
+            prompt,
+            llm,
+            RunnableLambda.from(async (input: BaseMessage) => {
+                const result = await outputParser.parse(
+                    getMessageContent(input.content) ?? ''
+                )
+
+                if (!Array.isArray(result) && 'returnValues' in result) {
+                    return {
+                        ...result,
+                        returnValues: {
+                            ...result.returnValues,
+                            message: input
+                        }
+                    }
+                }
+
+                return result
+            })
+        ],
+        'ReactAgent'
+    )
+    return agent
+}
+
+/**
+ * Construct the scratchpad that lets the agent continue its thought process.
+ * @param intermediateSteps
+ * @param observationPrefix
+ * @param llmPrefix
+ * @returns a string with the formatted observations and agent logs
+ */
+export function formatLogToString(
+    intermediateSteps: ScratchpadEntry[],
+    observationPrefix = 'Observation: ',
+    llmPrefix = ''
+): string {
+    const formattedSteps = intermediateSteps.reduce((thoughts, step) => {
+        if ('messages' in step) {
+            const text = step.messages
+                .map((msg) => {
+                    const content =
+                        typeof msg.content === 'string'
+                            ? msg.content
+                            : JSON.stringify(msg.content)
+                    return `[Human Update]: ${content}`
+                })
+                .join('\n')
+            return thoughts + `\n${text}\n`
+        }
+
+        const { action, observation } = step
+        const buffer: string[] = []
+
+        if (action.log) {
+            buffer.push(`<thought>${action.log}</thought>`)
+        }
+
+        if (action.toolInput) {
+            buffer.push(
+                `<tool_calling>${JSON.stringify([
+                    {
+                        name: action.tool,
+                        arguments: action.toolInput
+                    }
+                ])}</tool_calling>`
+            )
+        }
+
+        return (
+            thoughts +
+            [...buffer, `\n${observationPrefix}${observation}\n`].join('\n\n')
+        )
+    }, '')
+    return formattedSteps
+}

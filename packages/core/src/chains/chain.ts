@@ -1,4 +1,3 @@
-import { EventEmitter } from 'events'
 import { Context, h, Logger, Session } from 'koishi'
 import {
     ChatLunaError,
@@ -7,13 +6,13 @@ import {
 } from 'koishi-plugin-chatluna/utils/error'
 import { createLogger } from 'koishi-plugin-chatluna/utils/logger'
 import { Config } from '../config'
-import { lifecycleNames } from '../middlewares/lifecycle'
+import type { ChatInvocationContext, ConversationResolution } from '../types'
+import { lifecycleNames } from '../middlewares/system/lifecycle'
+import { formatDuration } from '../utils/time'
+import type { QQBot } from '@koishijs/plugin-adapter-qq'
 
 let logger: Logger
 
-/**
- * ChatChain为消息的发送和接收提供了一个统一的中间提供交互
- */
 export class ChatChain {
     public readonly _graph: ChatChainDependencyGraph
     private readonly _senders: ChatChainSender[]
@@ -29,9 +28,30 @@ export class ChatChain {
 
         const defaultChatChainSender = new DefaultChatChainSender(config)
 
-        this._senders.push((session, messages) =>
-            defaultChatChainSender.send(session, messages)
+        this._senders.push((session, messages, context) =>
+            defaultChatChainSender.send(session, messages, context)
         )
+    }
+
+    private _createRecallThinkingMessage(
+        context: ChainMiddlewareContext
+    ): () => Promise<void> {
+        return async () => {
+            if (!context.options?.thinkingTimeoutObject) return
+
+            const timeoutObj = context.options.thinkingTimeoutObject
+
+            clearTimeout(timeoutObj.timeout!)
+
+            timeoutObj.autoRecallTimeout &&
+                clearTimeout(timeoutObj.autoRecallTimeout)
+
+            timeoutObj.setQueueCount(0)
+            timeoutObj.recallFunc && (await timeoutObj.recallFunc())
+
+            timeoutObj.timeout = null
+            context.options.thinkingTimeoutObject = undefined
+        }
     }
 
     async receiveMessage(session: Session, ctx?: Context) {
@@ -40,77 +60,79 @@ export class ChatChain {
             message: session.content,
             ctx: ctx ?? this.ctx,
             session,
-            options: {},
-            send: (message) => this.sendMessage(session, message),
-            recallThinkingMessage: async () => {}
+            options: {
+                startedAt: Date.now()
+            },
+            send: (message) => this.sendMessage(session, message, context),
+            recallThinkingMessage: this._createRecallThinkingMessage(
+                {} as ChainMiddlewareContext
+            )
         }
 
-        context.recallThinkingMessage = async () => {
-            if (!context.options?.thinkingTimeoutObject) return
+        context.recallThinkingMessage =
+            this._createRecallThinkingMessage(context)
 
-            const timeoutObj = context.options.thinkingTimeoutObject
-
-            // Clear all timeouts
-            clearTimeout(timeoutObj.timeout!)
-
-            timeoutObj.autoRecallTimeout &&
-                clearTimeout(timeoutObj.autoRecallTimeout)
-
-            // Execute recall function if exists
-            timeoutObj.recallFunc && (await timeoutObj.recallFunc())
-
-            // Cleanup
-            timeoutObj.timeout = null
-            context.options.thinkingTimeoutObject = undefined
+        try {
+            return await this._runMiddleware(session, context)
+        } finally {
+            await context.options.completeMessageTurn?.()
+            await context.recallThinkingMessage()
         }
-
-        const result = await this._runMiddleware(session, context)
-
-        await context.recallThinkingMessage()
-
-        return result
     }
 
     async receiveCommand(
         session: Session,
         command: string,
-        options: ChainMiddlewareContextOptions = {}
+        options: ChainMiddlewareContextOptions = {},
+        ctx: Context = this.ctx
+    ) {
+        return (await this.runCommand(session, command, options, ctx)).ok
+    }
+
+    async runCommand(
+        session: Session,
+        command: string,
+        options: ChainMiddlewareContextOptions = {},
+        ctx: Context = this.ctx
     ) {
         const context: ChainMiddlewareContext = {
             config: this.config,
             message: options?.message ?? session.content,
-            ctx: this.ctx,
+            ctx,
             session,
             command,
-            send: (message) => this.sendMessage(session, message),
-            recallThinkingMessage: async () => {},
-            options
+            send: async (message) => {
+                if (
+                    options.invocation?.delivery === 'silent' ||
+                    options.invocation?.delivery === 'capture'
+                ) {
+                    return
+                }
+                await this.sendMessage(
+                    options.deliverySession ?? session,
+                    message,
+                    context
+                )
+            },
+            recallThinkingMessage: this._createRecallThinkingMessage(
+                {} as ChainMiddlewareContext
+            ),
+            options: {
+                ...options,
+                startedAt: Date.now()
+            }
         }
 
-        context.recallThinkingMessage = async () => {
-            if (!context.options?.thinkingTimeoutObject) return
+        context.recallThinkingMessage =
+            this._createRecallThinkingMessage(context)
 
-            const timeoutObj = context.options.thinkingTimeoutObject
-
-            // Clear all timeouts
-            clearTimeout(timeoutObj.timeout!)
-
-            timeoutObj.autoRecallTimeout &&
-                clearTimeout(timeoutObj.autoRecallTimeout)
-
-            // Execute recall function if exists
-            timeoutObj.recallFunc && (await timeoutObj.recallFunc())
-
-            // Cleanup
-            timeoutObj.timeout = null
-            context.options.thinkingTimeoutObject = undefined
+        try {
+            const ok = await this._runMiddleware(session, context)
+            return { ok, context }
+        } finally {
+            await context.options.completeMessageTurn?.()
+            await context.recallThinkingMessage()
         }
-
-        const result = await this._runMiddleware(session, context)
-
-        await context.recallThinkingMessage()
-
-        return result
     }
 
     middleware<T extends keyof ChainMiddlewareName>(
@@ -122,9 +144,9 @@ export class ChatChain {
 
         this._graph.addNode(result)
 
-        ctx.on('dispose', () => {
-            this._graph.removeNode(name)
-        })
+        const dispose = () => this._graph.removeNode(name)
+
+        ctx.effect(() => dispose)
 
         return result
     }
@@ -143,41 +165,19 @@ export class ChatChain {
         }
 
         const originMessage = context.message
+        const runLevels = this._graph.build()
 
-        const runList = this._graph.build()
-
-        if (runList.length === 0) {
+        if (runLevels.length === 0) {
             return false
         }
-
         let isOutputLog = false
 
-        for (const middleware of runList) {
-            let result: ChainMiddlewareRunStatus | h[] | h | h[][] | string
-            const startTime = Date.now()
+        for (const level of runLevels) {
+            const results = await this._executeLevel(level, session, context)
 
-            try {
-                result = await middleware.run(session, context)
-
-                // Log execution time if needed
-                const shouldLogTime =
-                    !middleware.name.startsWith('lifecycle-') &&
-                    result !== ChainMiddlewareRunStatus.SKIPPED &&
-                    middleware.name !== 'allow_reply' &&
-                    Date.now() - startTime > 10
-
-                if (shouldLogTime) {
-                    logger.debug(
-                        `middleware %c executed in %d ms`,
-                        middleware.name,
-                        Date.now() - startTime
-                    )
-                    isOutputLog = true
-                }
-
-                // Handle middleware result
-                if (result === ChainMiddlewareRunStatus.STOP) {
-                    await this.handleStopStatus(
+            for (const result of results) {
+                if (result.status === 'stop') {
+                    await this._handleStopStatus(
                         session,
                         context,
                         originMessage,
@@ -186,16 +186,27 @@ export class ChatChain {
                     return false
                 }
 
-                if (result instanceof Array || typeof result === 'string') {
-                    context.message = result
+                if (result.status === 'error') {
+                    context.options.error = result.error
+                    await this._handleMiddlewareError(
+                        session,
+                        context,
+                        result.middlewareName!,
+                        result.error!
+                    )
+                    return false
                 }
-            } catch (error) {
-                await this.handleMiddlewareError(
-                    session,
-                    middleware.name,
-                    error
-                )
-                return false
+
+                if (
+                    result.output instanceof Array ||
+                    typeof result.output === 'string'
+                ) {
+                    context.message = result.output
+                }
+
+                if (result.shouldLog) {
+                    isOutputLog = true
+                }
             }
         }
 
@@ -204,35 +215,155 @@ export class ChatChain {
         }
 
         if (context.message != null && context.message !== originMessage) {
-            // 消息被修改了
-            await this.sendMessage(session, context.message)
+            await context.send(context.message)
         }
 
         return true
     }
 
+    private async _executeLevel(
+        middlewares: ChainMiddleware[],
+        session: Session,
+        context: ChainMiddlewareContext
+    ): Promise<MiddlewareResult[]> {
+        const abortController = new AbortController()
+        const results: MiddlewareResult[] = []
+        let hasStopRequest = false
+        let hasError = false
+
+        const promises = middlewares.map(async (middleware, index) => {
+            try {
+                if (abortController.signal.aborted) {
+                    return {
+                        status: 'success' as const,
+                        output: ChainMiddlewareRunStatus.SKIPPED,
+                        middlewareName: middleware.name,
+                        shouldLog: false
+                    }
+                }
+
+                const result = await this._executeMiddleware(
+                    middleware,
+                    session,
+                    context,
+                    abortController.signal
+                )
+
+                if (result.status === 'stop' && !hasStopRequest) {
+                    hasStopRequest = true
+                    abortController.abort()
+                }
+
+                if (result.status === 'error' && !hasError) {
+                    hasError = true
+                    abortController.abort()
+                }
+
+                results[index] = result
+                return result
+            } catch (error) {
+                const errorResult: MiddlewareResult = {
+                    status: 'error',
+                    error: error as Error,
+                    middlewareName: middleware.name,
+                    shouldLog: false
+                }
+
+                if (!hasError) {
+                    hasError = true
+                    abortController.abort()
+                }
+
+                results[index] = errorResult
+                return errorResult
+            }
+        })
+
+        await Promise.all(promises)
+
+        return results.filter((result) => result !== undefined)
+    }
+
+    private async _executeMiddleware(
+        middleware: ChainMiddleware,
+        session: Session,
+        context: ChainMiddlewareContext,
+        abortSignal?: AbortSignal
+    ): Promise<MiddlewareResult> {
+        const startTime = Date.now()
+
+        try {
+            if (abortSignal?.aborted) {
+                return {
+                    status: 'success',
+                    output: ChainMiddlewareRunStatus.SKIPPED,
+                    middlewareName: middleware.name,
+                    shouldLog: false
+                }
+            }
+
+            const result = await middleware.run(session, context)
+            const executionTime = Date.now() - startTime
+
+            const shouldLogTime =
+                !middleware.name.startsWith('lifecycle-') &&
+                result !== ChainMiddlewareRunStatus.SKIPPED &&
+                middleware.name !== 'allow_reply' &&
+                executionTime > 100
+
+            if (shouldLogTime) {
+                logger.debug(
+                    `[Middleware] %c completed in %c`,
+                    middleware.name,
+                    formatDuration(executionTime)
+                )
+            }
+
+            if (result === ChainMiddlewareRunStatus.STOP) {
+                return {
+                    status: 'stop',
+                    middlewareName: middleware.name,
+                    shouldLog: shouldLogTime
+                }
+            }
+
+            return {
+                status: 'success',
+                output: result,
+                middlewareName: middleware.name,
+                shouldLog: shouldLogTime
+            }
+        } catch (error) {
+            return {
+                status: 'error',
+                error,
+                middlewareName: middleware.name,
+                shouldLog: false
+            }
+        }
+    }
+
     private async sendMessage(
         session: Session,
-        message: h[] | h[][] | h | string
+        message: h[] | h[][] | h | string,
+        context?: ChainMiddlewareContext
     ) {
-        // check if message is a two-dimensional array
-
         const messages: (h[] | h | string)[] =
             message instanceof Array ? message : [message]
 
         for (const sender of this._senders) {
-            await sender(session, messages)
+            await sender(session, messages, context)
         }
     }
 
-    private async handleStopStatus(
+    private async _handleStopStatus(
         session: Session,
         context: ChainMiddlewareContext,
         originMessage: string | h[] | h[][],
         isOutputLog: boolean
     ) {
         if (context.message != null && context.message !== originMessage) {
-            await this.sendMessage(session, context.message)
+            await context.send(context.message)
         }
 
         if (isOutputLog) {
@@ -240,18 +371,20 @@ export class ChatChain {
         }
     }
 
-    private async handleMiddlewareError(
+    private async _handleMiddlewareError(
         session: Session,
+        context: ChainMiddlewareContext,
         middlewareName: string,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        error: any
+        error: Error
     ) {
+        if (context.options.invocation != null) return
+
         if (error instanceof ChatLunaError) {
             const message =
                 error.errorCode === ChatLunaErrorCode.ABORTED
                     ? session.text('chatluna.aborted')
                     : error.message
-            await this.sendMessage(session, message)
+            await context.send(message)
             return
         }
 
@@ -260,8 +393,7 @@ export class ChatChain {
         error.cause && logger.error(error.cause)
         logger.debug('-'.repeat(40) + '\n')
 
-        await this.sendMessage(
-            session,
+        await context.send(
             session.text('chatluna.middleware_error', [
                 middlewareName,
                 error.message
@@ -270,46 +402,44 @@ export class ChatChain {
     }
 }
 
+interface MiddlewareResult {
+    status: 'success' | 'stop' | 'error'
+    output?: ChainMiddlewareRunStatus | h[] | h | h[][] | string | null
+    error?: Error
+    middlewareName?: string
+    shouldLog?: boolean
+}
+
 class ChatChainDependencyGraph {
-    private _tasks = new Map<string, ChainDependencyGraphNode>()
-    private _dependencies = new Map<string, Set<string>>()
-    private _eventEmitter = new EventEmitter()
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private _listeners = new Map<string, Set<(...args: any[]) => void>>()
-    private _cachedOrder: ChainMiddleware[] | null = null
+    private readonly _tasks = new Map<string, ChainDependencyGraphNode>()
+    private readonly _rules: ChainDependencyRule[] = []
+    private readonly _listeners = new Map<
+        string,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        Set<(...args: any[]) => void>
+    >()
 
-    constructor() {
-        this._eventEmitter.on('build_node', () => {
-            for (const [name, listeners] of this._listeners) {
-                for (const listener of listeners) {
-                    listener(name)
-                }
-                listeners.clear()
-            }
-            // Invalidate cache when nodes change
-            this._cachedOrder = null
-        })
-    }
+    private _cachedOrder: ChainMiddleware[][] | null = null
+    private _index = 0
 
-    // Add a task to the DAG.
     public addNode(middleware: ChainMiddleware): void {
         this._tasks.set(middleware.name, {
             name: middleware.name,
-            middleware
+            middleware,
+            index: this._index++
         })
-        this._cachedOrder = null // Invalidate cache
+        this._cachedOrder = null
     }
 
     removeNode(name: string): void {
         this._tasks.delete(name)
-
-        // Efficiently remove dependencies
-        this._dependencies.delete(name)
-        for (const deps of this._dependencies.values()) {
-            deps.delete(name)
+        for (let i = this._rules.length - 1; i >= 0; i--) {
+            const rule = this._rules[i]
+            if (rule.owner === name || rule.target === name) {
+                this._rules.splice(i, 1)
+            }
         }
-
-        this._cachedOrder = null // Invalidate cache
+        this._cachedOrder = null
     }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -319,7 +449,6 @@ class ChatChainDependencyGraph {
         this._listeners.set(name, listeners)
     }
 
-    // Set a dependency between two tasks
     before(
         taskA: ChainMiddleware | string,
         taskB: ChainMiddleware | string
@@ -331,16 +460,18 @@ class ChatChainDependencyGraph {
             taskB = taskB.name
         }
         if (taskA && taskB) {
-            // Add taskB to the dependencies of taskA
-            const dependencies = this._dependencies.get(taskA) ?? new Set()
-            dependencies.add(taskB)
-            this._dependencies.set(taskA, dependencies)
+            this._rules.push({
+                owner: taskA,
+                target: taskB,
+                type: 'before',
+                source: this._captureRuleSource()
+            })
+            this._cachedOrder = null
         } else {
             throw new Error('Invalid tasks')
         }
     }
 
-    // Set a reverse dependency between two tasks
     after(
         taskA: ChainMiddleware | string,
         taskB: ChainMiddleware | string
@@ -352,120 +483,489 @@ class ChatChainDependencyGraph {
             taskB = taskB.name
         }
         if (taskA && taskB) {
-            // Add taskB to the dependencies of taskA
-            const dependencies = this._dependencies.get(taskB) ?? new Set()
-            dependencies.add(taskA)
-            this._dependencies.set(taskB, dependencies)
+            this._rules.push({
+                owner: taskA,
+                target: taskB,
+                type: 'after',
+                source: this._captureRuleSource()
+            })
+            this._cachedOrder = null
         } else {
             throw new Error('Invalid tasks')
         }
     }
 
-    // Get dependencies of a task
     getDependencies(task: string) {
-        return this._dependencies.get(task)
-    }
+        const deps = new Set<string>()
 
-    // Get dependents of a task
-    getDependents(task: string): string[] {
-        const dependents: string[] = []
-        for (const [key, value] of this._dependencies.entries()) {
-            if ([...value].includes(task)) {
-                dependents.push(key)
+        for (const rule of this._rules) {
+            if (rule.owner === task && rule.type === 'after') {
+                deps.add(rule.target)
+            }
+
+            if (rule.target === task && rule.type === 'before') {
+                deps.add(rule.owner)
             }
         }
+
+        return deps
+    }
+
+    getDependents(task: string): string[] {
+        const dependents: string[] = []
+
+        for (const rule of this._rules) {
+            if (rule.owner === task && rule.type === 'before') {
+                dependents.push(rule.target)
+            }
+
+            if (rule.target === task && rule.type === 'after') {
+                dependents.push(rule.owner)
+            }
+        }
+
         return dependents
     }
 
-    // Build a two-dimensional array of tasks based on their dependencies
-    build(): ChainMiddleware[] {
-        // Return cached order if available
+    build(): ChainMiddleware[][] {
         if (this._cachedOrder) {
             return this._cachedOrder
         }
 
-        this._eventEmitter.emit('build_node')
-        // Create in-degree table and temporary graph
-        const indegree = new Map<string, number>()
-        const tempGraph = new Map<string, Set<string>>()
-
-        // Initialize in-degree and temporary graph
-        for (const taskName of this._tasks.keys()) {
-            indegree.set(taskName, 0)
-            tempGraph.set(taskName, new Set())
-        }
-
-        // Build temporary graph and calculate in-degree
-        for (const [from, deps] of this._dependencies.entries()) {
-            const depsSet = tempGraph.get(from) || new Set()
-            for (const to of deps) {
-                depsSet.add(to)
-                indegree.set(to, (indegree.get(to) || 0) + 1)
+        for (const [, listeners] of this._listeners) {
+            for (const listener of listeners) {
+                listener()
             }
-            tempGraph.set(from, depsSet)
+            listeners.clear()
         }
 
-        const queue: string[] = []
-        const result: ChainMiddleware[] = []
-        const visited = new Set<string>()
+        const lifecycleSet = new Set(lifecycleNames)
+        const nodes = [...this._tasks.values()].sort(
+            (a, b) => a.index - b.index
+        )
+        const nodeNames = new Set(nodes.map((node) => node.name))
+        const normalNodes = nodes.filter((node) => !lifecycleSet.has(node.name))
+        const ranges = new Map<string, ChainDependencyRange>()
+        const outgoing = new Map<string, ChainDependencyEdge[]>()
+        const incoming = new Map<string, ChainDependencyEdge[]>()
+        const slots = new Map<string, number>()
+        const slotCause = new Map<string, ChainDependencyEdge>()
 
-        // Find nodes with in-degree of 0
-        for (const [task, degree] of indegree.entries()) {
-            if (degree === 0) {
-                queue.push(task)
-            }
+        for (const node of normalNodes) {
+            ranges.set(node.name, {
+                min: 0,
+                max: lifecycleNames.length,
+                minRules: [],
+                maxRules: []
+            })
+            outgoing.set(node.name, [])
+            incoming.set(node.name, [])
+            slots.set(node.name, 0)
         }
 
-        // Topological sorting
-        while (queue.length > 0) {
-            const current = queue.shift()!
-
-            if (visited.has(current)) {
+        for (const rule of this._rules) {
+            if (!nodeNames.has(rule.owner)) {
                 continue
             }
-            visited.add(current)
 
-            const node = this._tasks.get(current)
-            if (node?.middleware) {
-                result.push(node.middleware)
+            if (!lifecycleSet.has(rule.target) && !nodeNames.has(rule.target)) {
+                throw new Error(
+                    `Unknown middleware "${rule.target}" referenced by ${this._formatRule(rule)}`
+                )
             }
 
-            // Process all successors of the current node
-            const successors = tempGraph.get(current) || new Set()
-            for (const next of successors) {
-                const newDegree = indegree.get(next)! - 1
-                indegree.set(next, newDegree)
+            if (lifecycleSet.has(rule.owner) && lifecycleSet.has(rule.target)) {
+                continue
+            }
 
-                if (newDegree === 0) {
-                    queue.push(next)
+            if (lifecycleSet.has(rule.target) || lifecycleSet.has(rule.owner)) {
+                const name = lifecycleSet.has(rule.target)
+                    ? rule.owner
+                    : rule.target
+
+                if (lifecycleSet.has(name)) {
+                    continue
+                }
+
+                const range = ranges.get(name)
+
+                if (!range) {
+                    continue
+                }
+
+                const lifecycleName = lifecycleSet.has(rule.target)
+                    ? rule.target
+                    : rule.owner
+                const idx = lifecycleNames.indexOf(lifecycleName)
+                const isAfter = lifecycleSet.has(rule.target)
+                    ? rule.type === 'after'
+                    : rule.type === 'before'
+
+                if (isAfter) {
+                    range.min = Math.max(range.min, idx + 1)
+                    range.minRules.push(rule)
+                } else {
+                    range.max = Math.min(range.max, idx)
+                    range.maxRules.push(rule)
+                }
+
+                slots.set(name, range.min)
+                continue
+            }
+
+            const edge: ChainDependencyEdge =
+                rule.type === 'before'
+                    ? {
+                          from: rule.owner,
+                          to: rule.target,
+                          rule
+                      }
+                    : {
+                          from: rule.target,
+                          to: rule.owner,
+                          rule
+                      }
+
+            outgoing.get(edge.from)?.push(edge)
+            incoming.get(edge.to)?.push(edge)
+        }
+
+        const stack: string[] = []
+        const onStack = new Set<string>()
+        const index = new Map<string, number>()
+        const lowLink = new Map<string, number>()
+        const cycles: string[][] = []
+        let cursor = 0
+
+        const visit = (name: string) => {
+            index.set(name, cursor)
+            lowLink.set(name, cursor)
+            cursor += 1
+            stack.push(name)
+            onStack.add(name)
+
+            for (const edge of outgoing.get(name) ?? []) {
+                const next = edge.to
+
+                if (!index.has(next)) {
+                    visit(next)
+                    lowLink.set(
+                        name,
+                        Math.min(lowLink.get(name)!, lowLink.get(next)!)
+                    )
+                    continue
+                }
+
+                if (onStack.has(next)) {
+                    lowLink.set(
+                        name,
+                        Math.min(lowLink.get(name)!, index.get(next)!)
+                    )
+                }
+            }
+
+            if (lowLink.get(name) !== index.get(name)) {
+                return
+            }
+
+            const group: string[] = []
+
+            while (true) {
+                const current = stack.pop()!
+                onStack.delete(current)
+                group.push(current)
+
+                if (current === name) {
+                    break
+                }
+            }
+
+            if (
+                group.length > 1 ||
+                (outgoing.get(group[0]) ?? []).some(
+                    (edge) => edge.to === group[0]
+                )
+            ) {
+                cycles.push(group)
+            }
+        }
+
+        for (const node of normalNodes) {
+            if (!index.has(node.name)) {
+                visit(node.name)
+            }
+        }
+
+        if (cycles.length > 0) {
+            const cycle = cycles[0]
+            const cycleSet = new Set(cycle)
+            const blocked = new Set<string>()
+            const queue = [...cycle]
+
+            while (queue.length > 0) {
+                const current = queue.shift()!
+
+                for (const edge of outgoing.get(current) ?? []) {
+                    if (cycleSet.has(edge.to) || blocked.has(edge.to)) {
+                        continue
+                    }
+
+                    blocked.add(edge.to)
+                    queue.push(edge.to)
+                }
+            }
+
+            const order = new Map(nodes.map((node) => [node.name, node.index]))
+            const cycleEdges = cycle
+                .flatMap((name) => outgoing.get(name) ?? [])
+                .filter((edge) => cycleSet.has(edge.to))
+                .sort(
+                    (a, b) =>
+                        (order.get(a.from) ?? 0) - (order.get(b.from) ?? 0) ||
+                        (order.get(a.to) ?? 0) - (order.get(b.to) ?? 0)
+                )
+            const blockedList = [...blocked].sort(
+                (a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0)
+            )
+
+            throw new Error(
+                [
+                    'Circular dependency detected in middleware graph.',
+                    `Cycle nodes: ${cycle
+                        .sort(
+                            (a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0)
+                        )
+                        .join(' -> ')}`,
+                    'Constraints:',
+                    ...cycleEdges.map(
+                        (edge) =>
+                            `- ${edge.from} -> ${edge.to} via ${this._formatRule(edge.rule)}`
+                    ),
+                    blockedList.length > 0
+                        ? `Blocked nodes: ${blockedList.join(', ')}`
+                        : ''
+                ]
+                    .filter((line) => line.length > 0)
+                    .join('\n')
+            )
+        }
+
+        const indegree = new Map<string, number>()
+
+        for (const node of normalNodes) {
+            indegree.set(node.name, incoming.get(node.name)?.length ?? 0)
+        }
+
+        const ready = normalNodes
+            .filter((node) => indegree.get(node.name) === 0)
+            .map((node) => node.name)
+        const topo: string[] = []
+
+        while (ready.length > 0) {
+            ready.sort(
+                (a, b) =>
+                    (this._tasks.get(a)?.index ?? 0) -
+                    (this._tasks.get(b)?.index ?? 0)
+            )
+
+            const current = ready.shift()!
+            const currentSlot = slots.get(current) ?? 0
+            const range = ranges.get(current)
+
+            if (range && currentSlot > range.max) {
+                const path: string[] = []
+                let name = current
+                const visited = new Set<string>()
+
+                while (slotCause.has(name) && !visited.has(name)) {
+                    visited.add(name)
+                    const edge = slotCause.get(name)!
+                    path.unshift(
+                        `- ${edge.from} -> ${edge.to} via ${this._formatRule(edge.rule)}`
+                    )
+                    name = edge.from
+                }
+
+                throw new Error(
+                    [
+                        `Cannot place middleware "${current}" in lifecycle order.`,
+                        `Resolved position: ${this._formatSlot(currentSlot)}`,
+                        `Latest allowed position: ${this._formatSlot(range.max)}`,
+                        range.minRules.length > 0 ? 'Required after:' : '',
+                        ...range.minRules.map(
+                            (rule) => `- ${this._formatRule(rule)}`
+                        ),
+                        range.maxRules.length > 0 ? 'Required before:' : '',
+                        ...range.maxRules.map(
+                            (rule) => `- ${this._formatRule(rule)}`
+                        ),
+                        path.length > 0 ? 'Dependency chain:' : '',
+                        ...path
+                    ]
+                        .filter((line) => line.length > 0)
+                        .join('\n')
+                )
+            }
+
+            topo.push(current)
+
+            for (const edge of outgoing.get(current) ?? []) {
+                if ((slots.get(edge.to) ?? 0) < currentSlot) {
+                    slots.set(edge.to, currentSlot)
+                    slotCause.set(edge.to, edge)
+                }
+
+                indegree.set(edge.to, (indegree.get(edge.to) ?? 0) - 1)
+
+                if (indegree.get(edge.to) === 0) {
+                    ready.push(edge.to)
                 }
             }
         }
 
-        // Check for circular dependencies
-        for (const [node, degree] of indegree.entries()) {
-            if (degree > 0) {
-                throw new Error(
-                    `Circular dependency detected involving node: ${node}`
-                )
+        const levels: ChainMiddleware[][] = []
+        const slotGroups = new Map<number, string[]>()
+
+        for (const name of topo) {
+            const slot = slots.get(name) ?? 0
+            const group = slotGroups.get(slot) ?? []
+            group.push(name)
+            slotGroups.set(slot, group)
+        }
+
+        for (let slot = 0; slot <= lifecycleNames.length; slot++) {
+            const group = slotGroups.get(slot) ?? []
+
+            if (group.length > 0) {
+                const groupSet = new Set(group)
+                const groupIndegree = new Map<string, number>()
+
+                for (const name of group) {
+                    groupIndegree.set(
+                        name,
+                        (incoming.get(name) ?? []).filter((edge) =>
+                            groupSet.has(edge.from)
+                        ).length
+                    )
+                }
+
+                let currentLevel = group
+                    .filter((name) => groupIndegree.get(name) === 0)
+                    .sort(
+                        (a, b) =>
+                            (this._tasks.get(a)?.index ?? 0) -
+                            (this._tasks.get(b)?.index ?? 0)
+                    )
+
+                while (currentLevel.length > 0) {
+                    levels.push(
+                        currentLevel.map((name) => {
+                            const task = this._tasks.get(name)
+                            if (task?.middleware == null) {
+                                throw new Error(
+                                    `Missing middleware for task ${name}`
+                                )
+                            }
+                            return task.middleware
+                        })
+                    )
+
+                    const nextLevel: string[] = []
+
+                    for (const name of currentLevel) {
+                        for (const edge of outgoing.get(name) ?? []) {
+                            if (!groupSet.has(edge.to)) {
+                                continue
+                            }
+
+                            groupIndegree.set(
+                                edge.to,
+                                (groupIndegree.get(edge.to) ?? 0) - 1
+                            )
+
+                            if (groupIndegree.get(edge.to) === 0) {
+                                nextLevel.push(edge.to)
+                            }
+                        }
+                    }
+
+                    currentLevel = nextLevel.sort(
+                        (a, b) =>
+                            (this._tasks.get(a)?.index ?? 0) -
+                            (this._tasks.get(b)?.index ?? 0)
+                    )
+                }
+            }
+
+            const lifecycle = this._tasks.get(lifecycleNames[slot])?.middleware
+
+            if (lifecycle) {
+                levels.push([lifecycle])
             }
         }
 
-        // Check if all nodes have been visited
-        if (visited.size !== this._tasks.size) {
-            throw new Error(
-                'Some nodes are unreachable in the dependency graph'
+        this._cachedOrder = levels
+        return levels
+    }
+
+    private _captureRuleSource() {
+        const stack = new Error().stack?.split('\n') ?? []
+
+        return stack
+            .map((line) => line.trim())
+            .find(
+                (line) =>
+                    line.length > 0 &&
+                    line !== 'Error' &&
+                    !line.includes('ChatChainDependencyGraph.') &&
+                    !line.includes('ChainMiddleware.') &&
+                    !line.includes('chains\\chain.') &&
+                    !line.includes('chains/chain.')
             )
+    }
+
+    private _formatRule(rule: ChainDependencyRule) {
+        const source = rule.source ? ` at ${rule.source}` : ''
+        return `.${rule.type}('${rule.target}') declared by ${rule.owner}${source}`
+    }
+
+    private _formatSlot(slot: number) {
+        if (slot <= 0) {
+            return `before ${lifecycleNames[0]}`
         }
 
-        this._cachedOrder = result
-        return result
+        if (slot >= lifecycleNames.length) {
+            return `after ${lifecycleNames[lifecycleNames.length - 1]}`
+        }
+
+        return `between ${lifecycleNames[slot - 1]} and ${lifecycleNames[slot]}`
     }
 }
 
 interface ChainDependencyGraphNode {
     middleware?: ChainMiddleware
     name: string
+    index: number
+}
+
+interface ChainDependencyRule {
+    owner: string
+    target: string
+    type: 'before' | 'after'
+    source?: string
+}
+
+interface ChainDependencyEdge {
+    from: string
+    to: string
+    rule: ChainDependencyRule
+}
+
+interface ChainDependencyRange {
+    min: number
+    max: number
+    minRules: ChainDependencyRule[]
+    maxRules: ChainDependencyRule[]
 }
 
 export class ChainMiddleware {
@@ -478,90 +978,11 @@ export class ChainMiddleware {
     before<T extends keyof ChainMiddlewareName>(name: T) {
         this.graph.before(this.name, name)
 
-        if (this.name.startsWith('lifecycle-')) {
-            return this
-        }
-
-        const lifecycleName = lifecycleNames
-
-        // 现在我们需要基于当前添加的依赖，去寻找这个依赖锚定的生命周期
-
-        // 如果当前添加的依赖是生命周期，那么我们需要找到这个生命周期的下一个生命周期
-        if (lifecycleName.includes(name)) {
-            const lastLifecycleName =
-                lifecycleName[lifecycleName.indexOf(name) - 1]
-
-            if (lastLifecycleName) {
-                this.graph.after(this.name, lastLifecycleName)
-            }
-
-            return this
-        }
-
-        // 如果不是的话，我们就需要寻找依赖锚定的生命周期
-
-        this.graph.once('build_node', () => {
-            const beforeMiddlewares = [
-                ...this.graph.getDependencies(name)
-            ].filter((name) => name.startsWith('lifecycle-'))
-
-            const afterMiddlewares = this.graph
-                .getDependents(name)
-                .filter((name) => name.startsWith('lifecycle-'))
-
-            for (const before of beforeMiddlewares) {
-                this.graph.before(this.name, before)
-            }
-
-            for (const after of afterMiddlewares) {
-                this.graph.after(this.name, after)
-            }
-        })
-
         return this
     }
 
     after<T extends keyof ChainMiddlewareName>(name: T) {
         this.graph.after(this.name, name)
-
-        if (this.name.startsWith('lifecycle-')) {
-            return this
-        }
-
-        const lifecycleName = lifecycleNames
-
-        // 现在我们需要基于当前添加的依赖，去寻找这个依赖锚定的生命周期
-
-        // 如果当前添加的依赖是生命周期，那么我们需要找到这个生命周期的下一个生命周期
-        if (lifecycleName.includes(name)) {
-            const nextLifecycleName =
-                lifecycleName[lifecycleName.indexOf(name) + 1]
-
-            if (nextLifecycleName) {
-                this.graph.before(this.name, nextLifecycleName)
-            }
-
-            return this
-        }
-
-        // 如果不是的话，我们就需要寻找依赖锚定的生命周期
-        this.graph.once('build_node', () => {
-            const beforeMiddlewares = [
-                ...this.graph.getDependencies(name)
-            ].filter((name) => name.startsWith('lifecycle-'))
-
-            const afterMiddlewares = this.graph
-                .getDependents(name)
-                .filter((name) => name.startsWith('lifecycle-'))
-
-            for (const before of beforeMiddlewares) {
-                this.graph.before(this.name, before)
-            }
-
-            for (const after of afterMiddlewares) {
-                this.graph.after(this.name, after)
-            }
-        })
 
         return this
     }
@@ -597,16 +1018,47 @@ class DefaultChatChainSender {
 
     async send(
         session: Session,
-        messages: (h[] | h | string)[]
+        messages: (h[] | h | string)[],
+        context?: ChainMiddlewareContext
     ): Promise<void> {
         if (!messages?.length) return
 
-        if (this.config.isForwardMsg) {
+        if (
+            isElementArray(messages?.[0]) &&
+            messages[0][1]?.type === 'markdown-qq'
+        ) {
+            await this.sendAsQQMarkdown(session, messages[0][0])
+            return
+        }
+
+        if (
+            this.config.isForwardMsg &&
+            this.getMessageText(messages).length >
+                this.config.forwardMsgMinLength
+        ) {
             await this.sendAsForward(session, messages)
             return
         }
 
-        await this.sendAsNormal(session, messages)
+        await this.sendAsNormal(session, messages, context)
+    }
+
+    private async sendAsQQMarkdown(
+        session: Session,
+        message: h
+    ): Promise<void> {
+        const { user } = session.event
+        // only support private
+        await (
+            session['bot'] as unknown as QQBot<Context>
+        ).internal.sendPrivateMessage(user.id, {
+            msg_type: 2,
+            msg_seq: 1,
+            msg_id: session.messageId,
+            markdown: {
+                content: message.attrs['content']
+            }
+        })
     }
 
     private async sendAsForward(
@@ -614,6 +1066,13 @@ class DefaultChatChainSender {
         messages: (h[] | h | string)[]
     ): Promise<void> {
         const sendMessages = this.convertToForwardMessages(messages)
+
+        if (
+            sendMessages.length < 1 ||
+            (sendMessages.length === 1 && sendMessages.join().length === 0)
+        ) {
+            return
+        }
 
         await session.sendQueued(
             h('message', { forward: true }, ...sendMessages)
@@ -624,17 +1083,14 @@ class DefaultChatChainSender {
         const firstMsg = messages[0]
 
         if (Array.isArray(firstMsg)) {
-            // h[][]
             return messages.map((msg) => h('message', ...(msg as h[])))
         }
 
         if (typeof firstMsg === 'object') {
-            // h | h[]
             return [h('message', ...(messages as h[]))]
         }
 
         if (typeof firstMsg === 'string') {
-            // string
             return [h.text(firstMsg)]
         }
 
@@ -643,12 +1099,14 @@ class DefaultChatChainSender {
 
     private async sendAsNormal(
         session: Session,
-        messages: (h[] | h | string)[]
+        messages: (h[] | h | string)[],
+        context?: ChainMiddlewareContext
     ): Promise<void> {
         for (const message of messages) {
             const messageFragment = await this.buildMessageFragment(
                 session,
-                message
+                message,
+                context
             )
 
             if (!messageFragment?.length) continue
@@ -660,20 +1118,32 @@ class DefaultChatChainSender {
 
     private async buildMessageFragment(
         session: Session,
-        message: h[] | h | string
+        message: h[] | h | string,
+        context?: ChainMiddlewareContext
     ): Promise<h[]> {
+        const start = context?.options?.startedAt
+        const elapsed = start ? Date.now() - start : 0
+        const threshold = (this.config.replyQuoteThreshold ?? 0) * 1000
         const shouldAddQuote =
             this.config.isReplyWithAt &&
             session.isDirect === false &&
-            session.messageId
+            session.messageId &&
+            elapsed >= threshold
 
         const messageContent = this.convertMessageToArray(message)
+
+        if (
+            messageContent == null ||
+            messageContent.length < 1 ||
+            (messageContent.length === 1 && messageContent.join().length === 0)
+        ) {
+            return
+        }
 
         if (!shouldAddQuote) {
             return messageContent
         }
 
-        // Check if quote should be removed (for audio or message types)
         const quote = h('quote', { id: session.messageId })
         const hasIncompatibleType = messageContent.some(
             (element) => element.type === 'audio' || element.type === 'message'
@@ -691,6 +1161,20 @@ class DefaultChatChainSender {
         }
         return [message]
     }
+
+    private getMessageText(message: (h[] | h | string)[]) {
+        return message
+            .map((element) => {
+                if (typeof element === 'string') {
+                    return element
+                }
+                if (Array.isArray(element)) {
+                    return h.select(element, 'text').toString()
+                }
+                return element.toString()
+            })
+            .join(' ')
+    }
 }
 
 export interface ChainMiddlewareContext {
@@ -705,6 +1189,11 @@ export interface ChainMiddlewareContext {
 }
 
 export interface ChainMiddlewareContextOptions {
+    conversation?: ConversationResolution
+    invocation?: ChatInvocationContext
+    deliverySession?: Session
+    messageName?: string
+    error?: Error
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     [key: string]: any
 }
@@ -718,11 +1207,22 @@ export type ChainMiddlewareFunction = (
 
 export type ChatChainSender = (
     session: Session,
-    message: (h[] | h | string)[]
+    message: (h[] | h | string)[],
+    context?: ChainMiddlewareContext
 ) => Promise<void>
 
 export enum ChainMiddlewareRunStatus {
     SKIPPED = 0,
     STOP = 1,
     CONTINUE = 2
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function isElementArray(value: any): value is h[] {
+    return (
+        Array.isArray(value) &&
+        value.every(
+            (item) => typeof item === 'object' && item.attrs && item.type
+        )
+    )
 }

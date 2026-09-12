@@ -1,0 +1,48 @@
+$inner:
+    - {}
+    - $desc: 'Conversation & AI Features'
+      todos: 'Enable task decomposition. Can generate multi-step task lists and automatically break down tasks'
+      todosNotify: 'Notify user with current task list on every todos tool call'
+      chat: 'Enable interactive query. Note: Rebuilds tool chain'
+
+    - $desc: 'Creative Content Features'
+      draw: 'Enable text-to-image (uses Koishi text-to-image plugin)'
+      music: 'Enable simple audio generation. (Requires installation and activation of [@dgck81lnn/music](https://github.com/DGCK81LNN/koishi-plugin-music))'
+    - $desc: 'System Tools Features'
+      request: 'Enable request plugin (GET/POST interface)'
+      fs: 'Enable fs plugin (file read/write interface)'
+      command: 'Enable command assistance (execute Koishi bot commands)'
+      codeSandbox: 'Enable Python code execution (requires API key)'
+    - $desc: 'Extended Services Features'
+      group: 'Enable group management plugin'
+      knowledge: 'Enable knowledge base plugin calls'
+
+    - - $desc: 'Request Plugin Configuration'
+        requestMaxOutputLength: 'Max output length for request plugin'
+        requestSelector: 'Keywords to trigger request tool. Always selected when empty.'
+        requestHeaders:
+            $desc: 'Configure request headers based on domain matching.'
+            $inner:
+                matcher: 'Domain matcher pattern (supports wildcards, e.g., *.example.com, api.github.com).'
+                headers: 'Request headers to apply when this domain matches.'
+
+    - - $desc: 'Command Plugin Configuration'
+        commandWithSend: Whether to send command execution results by default.
+        commandAutoExecute: DANGEROUS - Allow all commands to execute without confirmation. This may cause unexpected operations. Use at your own risk. Default is disabled for safety.
+        commandList:
+            $desc: 'Available commands. If empty, all first-level commands are registered'
+            $inner:
+                command: 'Command to trigger'
+                description: 'Description of the command tool'
+                selector: 'Keyword to trigger the command'
+                confirm: 'Whether validation is required when executing the command'
+        commandBlacklist: 'Blacklist of top-level commands to block (including all sub-commands). Sensitive management commands are blocked by default.'
+
+    - - $desc: 'Group Management Plugin Configuration'
+        groupScopeSelector:
+            $desc: 'Member IDs allowed to use group management functions'
+        groupWhitelist:
+            $desc: 'Group ID whitelist for using group management functions. Available in all groups when empty.'
+
+    - - $desc: 'Music Generation Plugin Configuration'
+        musicSelector: 'Keywords to trigger music generation tool. Always selected when empty.'

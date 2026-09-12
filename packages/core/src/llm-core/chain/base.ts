@@ -11,6 +11,7 @@ import { ChainValues } from '@langchain/core/utils/types'
 import { Session } from 'koishi'
 import { BufferMemory } from 'koishi-plugin-chatluna/llm-core/memory/langchain'
 import { ChatEvents } from '../../services/types'
+import { ToolMask } from '../agent'
 import { ChatLunaChatModel } from 'koishi-plugin-chatluna/llm-core/platform/model'
 import {
     ChatLunaError,
@@ -20,9 +21,10 @@ import {
     BaseLangChain,
     BaseLangChainParams
 } from '@langchain/core/language_models/base'
-import { RUN_KEY } from '@langchain/core/outputs'
+import { ChatGeneration, RUN_KEY } from '@langchain/core/outputs'
 import { BaseMemory } from '@langchain/core/memory'
 import type { PostHandler } from '../../utils/types'
+import type { AgentEvent, MessageQueue } from '../agent/types'
 
 export type SystemPrompts = BaseMessage[]
 
@@ -39,11 +41,20 @@ export interface ChatLunaLLMCallArg {
     events: ChatEvents
     stream: boolean
     conversationId: string
+    requestId: string
     session: Session
+    source?: 'chatluna' | 'character'
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     variables?: Record<string, any>
     signal?: AbortSignal
     postHandler?: PostHandler
+    maxToken?: number
+    maxTokenLimit?: number
+    messageQueue?: MessageQueue
+    onAgentEvent?: (event: AgentEvent) => Promise<void> | void
+    toolMask?: ToolMask
+    callbacks?: Callbacks
+    persist?: boolean
 }
 
 export interface ChatLunaLLMChainInput extends ChainInputs {
@@ -75,14 +86,15 @@ export interface ChainInputs extends BaseLangChainParams {
  * Base interface that all chains must implement.
  */
 export abstract class BaseChain<
-        RunInput extends ChainValues = ChainValues,
-        RunOutput extends ChainValues = ChainValues
-    >
+    RunInput extends ChainValues = ChainValues,
+    RunOutput extends ChainValues = ChainValues
+>
     extends BaseLangChain<RunInput, RunOutput>
     implements ChainInputs
 {
     declare memory?: BaseMemory
 
+    // eslint-disable-next-line @typescript-eslint/naming-convention
     get lc_namespace(): string[] {
         return ['langchain', 'chains', this._chainType()]
     }
@@ -134,6 +146,7 @@ export abstract class BaseChain<
     ): Promise<RunOutput> {
         const config = ensureConfig(options)
         const fullValues = await this._formatValues(input)
+        // eslint-disable-next-line @typescript-eslint/naming-convention
         const callbackManager_ = CallbackManager.configure(
             config?.callbacks,
             this.callbacks,
@@ -268,9 +281,9 @@ export abstract class BaseChain<
 }
 
 export class ChatLunaLLMChain<
-        RunInput extends ChainValues = ChainValues,
-        RunOutput extends ChainValues = ChainValues
-    >
+    RunInput extends ChainValues = ChainValues,
+    RunOutput extends ChainValues = ChainValues
+>
     extends BaseChain<RunInput, RunOutput>
     implements ChatLunaLLMChainInput
 {
@@ -331,6 +344,7 @@ export class ChatLunaLLMChain<
         return {
             [this.outputKey]: generation.text,
             rawGeneration: generation,
+            message: (generation as ChatGeneration).message,
             extra: generation?.generationInfo
         } as unknown as RunOutput
     }
@@ -359,24 +373,34 @@ export class ChatLunaLLMChain<
 export async function callChatLunaChain(
     chain: ChatLunaLLMChain,
     values: ChainValues & ChatLunaLLMChain['llm']['ParsedCallOptions'],
-    events: ChatEvents
+    events: ChatEvents,
+    callbacks?: Callbacks
 ): Promise<ChainValues> {
     let usedToken = 0
+    const manager =
+        CallbackManager.configure(callbacks) ?? new CallbackManager()
 
-    const response = await chain.invoke(values, {
-        callbacks: [
-            {
-                handleLLMNewToken(token: string) {
-                    events?.['llm-new-token']?.(token)
-                },
-                handleLLMEnd(output, runId, parentRunId, tags) {
-                    usedToken += output.llmOutput?.tokenUsage?.totalTokens ?? 0
+    manager.addHandler(
+        CallbackManager.fromHandlers({
+            async handleLLMNewToken(token: string) {
+                await events?.['llm-new-token']?.(token)
+            },
+            async handleLLMEnd(output) {
+                usedToken += output.llmOutput?.usage_metadata?.total_tokens ?? 0
+            },
+            async handleCustomEvent(eventName, data) {
+                if (eventName === 'LLMNewChunk') {
+                    await events?.['llm-new-chunk']?.(data)
                 }
             }
-        ]
+        }).handlers[0]
+    )
+
+    const response = await chain.invoke(values, {
+        callbacks: manager
     })
 
-    await events?.['llm-used-token-count'](usedToken)
+    await events?.['llm-used-token-count']?.(usedToken)
 
     return response
 }

@@ -1,0 +1,28 @@
+$inner:
+    - $desc: Context Image Description Service
+      enableContextImageDescription: 'Enable image description in chat context.'
+      enableContextGifHandling: 'Enable GIF handling (input and description) in chat context.'
+
+    - $desc: Image/File URL Read & Describe Tool
+      enableImageReadTool: 'Enable non-GIF image read/describe capability in read_files.'
+      enableGifReadTool: 'Enable GIF read/describe capability in read_files.'
+      enableFileReadTool: 'Enable general file read capability in read_files (text, PDF, JSON, audio, video, etc., subject to model capabilities).'
+
+    - $desc: Audio Conversion Settings
+      enableAudioFfmpegConversion: 'Enable ffmpeg conversion for unsupported audio formats. Only audio formats not natively supported by the current model are transcoded to MP3 before input. This requires koishi-plugin-ffmpeg-path to be installed and enabled. Official QQ bot silk audio relies on the silk service provided by koishi-plugin-ffmpeg-path 2.0.0 or later.'
+
+    - $desc: File Read Settings
+      fileInsertPrompt: Prompt prepended to injected file content (images, audio, video, PDF, text, etc.) in the context. Used to guide the model to answer questions based on the provided file content.
+
+    - $desc: Image Multimodal Config
+      imageModel: 'Select an image model that supports image input (e.g.: gpt-4o, gemini-2.0-flash)'
+      imagePrompt: Image input system prompt
+      imageInsertPrompt: Image description insertion prompt
+      gifStrategy:
+          $desc: GIF frame extraction strategy
+          $inner:
+              - Extract only first frame
+              - Extract first N frames
+              - Extract average N frames
+
+      gifFrameCount: Number of frames to extract (only effective for "head N frames" or "average N frames" strategy)

@@ -1,14 +1,19 @@
-import { Time } from 'koishi'
 import {
     ChatLunaError,
-    ChatLunaErrorCode
+    ChatLunaErrorCode,
+    createAbortError
 } from 'koishi-plugin-chatluna/utils/error'
 import { ObjectLock } from 'koishi-plugin-chatluna/utils/lock'
 import { withResolver } from 'koishi-plugin-chatluna/utils/promise'
+const TIME_MINUTE = 60 * 1000
 
 interface QueueItem {
     requestId: string
     timestamp: number
+    // active=true means this waiter has already entered the runnable window.
+    active: boolean
+    // Queue wait timeout is calculated per item from its position.
+    timeout: number
     notifyPromise: {
         promise: Promise<void>
         resolve: () => void
@@ -19,12 +24,15 @@ interface QueueItem {
 export class RequestIdQueue {
     private _queue: Record<string, QueueItem[]> = {}
     private _queueLocks: Record<string, ObjectLock> = {}
+    // Per-key runnable window size used when waking the next batch.
+    private _limits: Record<string, number> = {}
     private readonly _maxQueueSize = 50
     private readonly _queueTimeout: number
 
-    constructor(queueTimeout = Time.minute * 3) {
+    constructor(queueTimeout = TIME_MINUTE * 3) {
         this._queueTimeout = queueTimeout
-        setInterval(() => this.cleanup(), queueTimeout)
+        const timer = setInterval(() => this.cleanup(), queueTimeout)
+        timer.unref?.()
     }
 
     public async add(key: string, requestId: string) {
@@ -44,6 +52,8 @@ export class RequestIdQueue {
         const queueItem: QueueItem = {
             requestId,
             timestamp: Date.now(),
+            active: false,
+            timeout: this._queueTimeout,
             notifyPromise: { promise, resolve, reject }
         }
 
@@ -71,6 +81,9 @@ export class RequestIdQueue {
 
                 this._queue[key].push(queueItem)
                 isFirst = this._queue[key].length === 1
+                if (isFirst) {
+                    queueItem.active = true
+                }
             })
 
             // Resolve immediately if it's the first item (outside lock)
@@ -92,11 +105,12 @@ export class RequestIdQueue {
             this._queueLocks[key] = new ObjectLock(this._queueTimeout)
         }
 
-        let nextItem: QueueItem | undefined
-        let shouldCleanup = false
+        const lock = this._queueLocks[key]
+        const items: QueueItem[] = []
+        let removed: QueueItem | undefined
 
         try {
-            await this._queueLocks[key].runLocked(async () => {
+            await lock.runLocked(async () => {
                 if (!this._queue[key]) return
 
                 const index = this._queue[key].findIndex(
@@ -106,55 +120,66 @@ export class RequestIdQueue {
                 if (index === -1) return
 
                 // Remove the item
-                this._queue[key].splice(index, 1)
+                removed = this._queue[key].splice(index, 1)[0]
 
-                // Check if we need to cleanup
                 if (this._queue[key].length === 0) {
-                    shouldCleanup = true
+                    delete this._queue[key]
+                    delete this._limits[key]
                     return
                 }
 
-                // Get next item if we removed the first item
-                if (index === 0 && this._queue[key].length > 0) {
-                    nextItem = this._queue[key][0]
+                const limit = this._limits[key] ?? 1
+                // Free every slot that just became runnable, not only the head.
+                for (
+                    let idx = 0;
+                    idx < this._queue[key].length && idx < limit;
+                    idx++
+                ) {
+                    const item = this._queue[key][idx]
+                    if (item.active) {
+                        continue
+                    }
+
+                    item.active = true
+                    items.push(item)
                 }
             })
 
-            // Perform cleanup outside the lock if needed
-            if (shouldCleanup) {
-                delete this._queue[key]
-                delete this._queueLocks[key]
-                return
+            // Settle removed waiters so abort/cancel paths do not hang.
+            if (removed != null && !removed.active) {
+                removed.notifyPromise.reject(createAbortError())
             }
 
-            // Notify next item outside the lock
-            if (nextItem) {
-                nextItem.notifyPromise.resolve()
-            }
+            items.forEach((item) => item.notifyPromise.resolve())
         } catch (error) {
             console.error('Error in remove operation:', error)
             // Don't throw here to prevent queue from getting stuck
         }
     }
 
-    public async wait(key: string, requestId: string, maxConcurrent: number) {
-        // Fast path: if queue doesn't exist, add directly
+    public async wait(
+        key: string,
+        requestId: string,
+        maxConcurrent: number,
+        timeout: number = this._queueTimeout
+    ) {
         if (!this._queue[key]) {
             await this.add(key, requestId)
-            return
         }
 
-        // Get or create lock for this specific queue
         if (!this._queueLocks[key]) {
             this._queueLocks[key] = new ObjectLock(this._queueTimeout)
         }
 
+        const lock = this._queueLocks[key]
+        const limit = maxConcurrent > 0 ? maxConcurrent : 1
         let item: QueueItem | undefined
         let shouldExecute = false
 
-        // Get queue item information within the lock
-        await this._queueLocks[key].runLocked(async () => {
+        await lock.runLocked(async () => {
             if (!this._queue[key]) return
+
+            this._limits[key] = limit
 
             const index = this._queue[key].findIndex(
                 (item) => item.requestId === requestId
@@ -162,45 +187,48 @@ export class RequestIdQueue {
 
             if (index === -1) return
 
-            // Execute immediately if it's the first item or within concurrent limit
-            if (index === 0 || index < maxConcurrent) {
-                shouldExecute = true
-                return
-            }
-
             item = this._queue[key][index]
+            // Waiting time grows by batches ahead of this item so long-running
+            // requests do not force later waiters to hit the old fixed 3m limit.
+            item.timeout =
+                index < limit
+                    ? timeout
+                    : Math.max(
+                          this._queueTimeout,
+                          Math.ceil(index / limit) * timeout
+                      )
+
+            if (index < limit) {
+                item.active = true
+                shouldExecute = true
+            }
         })
 
-        // If should execute immediately, return
-        if (shouldExecute) {
-            item?.notifyPromise.resolve()
+        if (shouldExecute || item == null) {
             return
         }
 
-        // Wait for turn
-        if (item) {
-            let timeoutId: NodeJS.Timeout
-            try {
-                // eslint-disable-next-line promise/param-names
-                const timeoutPromise = new Promise<never>((_, reject) => {
-                    timeoutId = setTimeout(() => {
-                        reject(
-                            new Error(
-                                `Queue wait timeout after ${this._queueTimeout}ms`
-                            )
-                        )
-                    }, this._queueTimeout)
-                })
+        let timeoutId: NodeJS.Timeout
+        const timeoutError = new Error(
+            `Queue wait timeout after ${item.timeout}ms`
+        )
 
-                await Promise.race([item.notifyPromise.promise, timeoutPromise])
-            } catch (error) {
-                await this.remove(key, requestId).catch(() => {
-                    /* ignore */
-                })
-                throw error
-            } finally {
-                clearTimeout(timeoutId)
-            }
+        try {
+            // eslint-disable-next-line promise/param-names
+            const timeoutPromise = new Promise<never>((_, reject) => {
+                timeoutId = setTimeout(() => {
+                    reject(timeoutError)
+                }, item.timeout)
+            })
+
+            await Promise.race([item.notifyPromise.promise, timeoutPromise])
+        } catch (error) {
+            await this.remove(key, requestId).catch(() => {
+                /* ignore */
+            })
+            throw error
+        } finally {
+            clearTimeout(timeoutId)
         }
     }
 
@@ -214,39 +242,58 @@ export class RequestIdQueue {
                 this._queueLocks[key] = new ObjectLock(this._queueTimeout)
             }
 
-            await this._queueLocks[key].runLocked(async () => {
+            const lock = this._queueLocks[key]
+            const expired: QueueItem[] = []
+            const items: QueueItem[] = []
+
+            await lock.runLocked(async () => {
                 if (!this._queue[key]) return
 
-                const expiredItems = this._queue[key].filter(
-                    (item) => now - item.timestamp >= this._queueTimeout
-                )
+                for (const item of this._queue[key]) {
+                    // Cleanup only expires items that are still waiting. Active
+                    // requests are stopped by runtime idle timeout instead.
+                    if (!item.active && now - item.timestamp >= item.timeout) {
+                        expired.push(item)
+                    }
+                }
 
-                // Notify all expired items
-                expiredItems.forEach((item) => {
-                    item.notifyPromise.reject(
-                        new Error(
-                            `Queue wait timeout after ${this._queueTimeout}ms`
-                        )
-                    )
-                })
-
-                // Remove expired items
-                this._queue[key] = this._queue[key].filter(
-                    (item) => now - item.timestamp < this._queueTimeout
-                )
-
-                // If queue becomes empty after cleanup, remove the lock
-                if (this._queue[key].length === 0) {
-                    delete this._queue[key]
-                    delete this._queueLocks[key]
+                if (expired.length === 0) {
                     return
                 }
 
-                // If the head of the queue was cleaned up, notify the new head
-                if (this._queue[key].length > 0) {
-                    this._queue[key][0].notifyPromise.resolve()
+                this._queue[key] = this._queue[key].filter(
+                    (item) => item.active || now - item.timestamp < item.timeout
+                )
+
+                if (this._queue[key].length === 0) {
+                    delete this._queue[key]
+                    delete this._limits[key]
+                    return
+                }
+
+                const limit = this._limits[key] ?? 1
+                for (
+                    let idx = 0;
+                    idx < this._queue[key].length && idx < limit;
+                    idx++
+                ) {
+                    const item = this._queue[key][idx]
+                    if (item.active) {
+                        continue
+                    }
+
+                    item.active = true
+                    items.push(item)
                 }
             })
+
+            expired.forEach((item) => {
+                item.notifyPromise.reject(
+                    new Error(`Queue wait timeout after ${item.timeout}ms`)
+                )
+            })
+
+            items.forEach((item) => item.notifyPromise.resolve())
         }
     }
 

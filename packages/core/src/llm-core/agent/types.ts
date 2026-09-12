@@ -1,8 +1,17 @@
-import type { Runnable } from '@langchain/core/runnables'
-import { BaseOutputParser } from '@langchain/core/output_parsers'
-import type { AgentAction, AgentFinish } from '@langchain/core/agents'
-import type { BaseMessage } from '@langchain/core/messages'
-import type { ChainValues } from '@langchain/core/utils/types'
+import type {
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    MessageContent,
+    MessageContentImageUrl,
+    MessageContentText
+} from '@langchain/core/messages'
+import type {
+    MessageContentAudio,
+    MessageContentFileUrl,
+    MessageContentVideo
+} from 'koishi-plugin-chatluna/utils/langchain'
+import type { DirectToolOutput } from '@langchain/core/messages/tool'
 
 export interface ChatCompletionMessageToolCall {
     /**
@@ -143,9 +152,7 @@ export interface ChatCompletionTool {
  * functions are present.
  */
 export type ChatCompletionToolChoiceOption =
-    | 'none'
-    | 'auto'
-    | ChatCompletionNamedToolChoice
+    'none' | 'auto' | ChatCompletionNamedToolChoice
 
 export interface ChatCompletionToolMessageParam {
     /**
@@ -164,73 +171,153 @@ export interface ChatCompletionToolMessageParam {
     tool_call_id: string
 }
 
-/**
- * Interface defining the input for creating an agent. It includes the
- * LLMChain instance, an optional output parser, and an optional list of
- * allowed tools.
- */
-export interface AgentInput {
-    // llmChain: LLMChain
-    outputParser: AgentActionOutputParser | undefined
-    allowedTools?: string[]
+export type AgentAction = {
+    tool: string
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    toolInput: string | Record<string, any>
+    toolCallId?: string
+    log: string
+    content?: MessageContent
+    reasoningContent?: string
+    messageLog?: BaseMessage[]
 }
 
-/**
- * Interface defining the input for creating a single action agent
- * that uses runnables.
- */
-export interface RunnableSingleActionAgentInput {
-    runnable: Runnable<
-        ChainValues & {
-            agent_scratchpad?: string | BaseMessage[]
-            stop?: string[]
-        },
-        AgentAction | AgentFinish
-    >
-    streamRunnable?: boolean
-    defaultRunName?: string
+export type AgentFinish = {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    returnValues: Record<string, any>
+    log: string
 }
 
-/**
- * Interface defining the input for creating a multi-action agent that uses
- * runnables. It includes the Runnable instance, and an optional list of
- * stop strings.
- */
-export interface RunnableMultiActionAgentInput {
-    runnable: Runnable<
-        ChainValues & {
-            agent_scratchpad?: string | BaseMessage[]
-            stop?: string[]
-        },
-        AgentAction[] | AgentAction | AgentFinish
-    >
-    streamRunnable?: boolean
-    defaultRunName?: string
-    stop?: string[]
+export type AgentObservationComplexContent =
+    | MessageContentImageUrl
+    | MessageContentText
+    | MessageContentFileUrl
+    | MessageContentAudio
+    | MessageContentVideo
+
+export type AgentDirectToolObservation = DirectToolOutput & {
+    replyEmitted?: boolean
 }
 
-/** @deprecated Renamed to RunnableMultiActionAgentInput. */
-export interface RunnableAgentInput extends RunnableMultiActionAgentInput {}
+export type AgentObservation =
+    AgentObservationComplexContent[] | AgentDirectToolObservation | string
 
-/**
- * Abstract class representing an output parser specifically for agent
- * actions and finishes in LangChain. It extends the `BaseOutputParser`
- * class.
- */
-export abstract class AgentActionOutputParser extends BaseOutputParser<
-    AgentAction | AgentFinish
-> {}
+export interface ToolMask {
+    mode: 'all' | 'allow' | 'deny'
+    tools?: string[]
+    allow: string[]
+    deny: string[]
+    toolCallMask?: ToolMask
+}
 
-/**
- * Abstract class representing an output parser specifically for agents
- * that return multiple actions.
- */
-export abstract class AgentMultiActionOutputParser extends BaseOutputParser<
-    AgentAction[] | AgentFinish
-> {}
+export interface AgentRunContext {
+    kind: 'main' | 'subagent'
+    agentId: string
+    agentName: string
+    conversationId: string
+    requestId: string
+    source: 'chatluna' | 'character'
+    userId?: string
+    guildId?: string
+    channelId?: string
+    toolMask?: ToolMask
+    subagentContext?: SubagentContext
+}
 
-/**
- * Type representing the stopping method for an agent. It can be either
- * 'force' or 'generate'.
- */
-export type StoppingMethod = 'force' | 'generate'
+export interface SubagentContext {
+    parentConversationId: string
+    depth: number
+    maxDepth: number
+    disableHandoff: boolean
+    traceInfo: {
+        runId: string
+        parentAgent: string
+        startedAt: number
+        parentRequestId?: string
+    }
+}
+
+export type AgentStep = {
+    action: AgentAction
+    observation: AgentObservation
+}
+
+export type ScratchpadEntry =
+    | AgentStep
+    | {
+          type: 'human_update'
+          messages: HumanMessage[]
+      }
+
+export type AgentEvent =
+    | {
+          type: 'tool-call'
+          actions: AgentAction[]
+      }
+    | {
+          type: 'tool-result'
+          steps: AgentStep[]
+      }
+    | {
+          type: 'human-update'
+          messages: HumanMessage[]
+      }
+    | {
+          type: 'round-decision'
+          canContinue?: boolean
+      }
+    | {
+          type: 'done'
+          output: string
+          log: string
+          steps: AgentStep[]
+          message?: AIMessage
+          replyEmitted?: boolean
+      }
+
+export const CHATLUNA_AGENT_EVENT = 'chatluna-agent-event'
+
+export interface AgentCallbackEvent {
+    context?: AgentRunContext
+    event: AgentEvent
+}
+
+export interface AgentRuntimeConfigurable {
+    messageQueue?: MessageQueue
+    pauseGate?: (signal?: AbortSignal) => Promise<void>
+    onAgentEvent?: (event: AgentEvent) => Promise<void> | void
+    agentContext?: AgentRunContext
+}
+
+export class MessageQueue {
+    private _queue: HumanMessage[] = []
+
+    push(...messages: HumanMessage[]): boolean {
+        this._queue.push(...messages)
+        return true
+    }
+
+    drain(): HumanMessage[] {
+        return this._queue.splice(0)
+    }
+
+    get pending(): boolean {
+        return this._queue.length > 0
+    }
+}
+
+export function applyToolMask(name: string, mask?: ToolMask) {
+    if (!mask || mask.mode === 'all') {
+        return true
+    }
+
+    if (mask.tools && !mask.tools.includes(name)) {
+        return true
+    }
+
+    if (mask.mode === 'allow') {
+        return mask.allow.includes(name)
+    }
+
+    return !mask.deny.includes(name)
+}

@@ -4,16 +4,16 @@ import { Config } from 'koishi-plugin-chatluna'
 export function apply(ctx: Context, config: Config): void {
     const cache = new Map<string, AuthorsNoteCache>()
 
-    ctx.on(
-        'chatluna/before-chat',
+    ctx.before(
+        'chatluna/chat',
         async (
             conversationId,
             message,
-            promptVariables,
+            _promptVariables,
             chatInterface,
             chain
         ) => {
-            const preset = await chatInterface.preset
+            const preset = chatInterface.preset.value
 
             const authorsNote = preset.authorsNote
 
@@ -34,7 +34,12 @@ export function apply(ctx: Context, config: Config): void {
 
             cache.set(conversationId, authorsNoteCache)
 
-            promptVariables['authors_note'] = authorsNote
+            ctx.chatluna.contextManager.inject({
+                conversationId,
+                name: 'authors_note',
+                value: authorsNote,
+                once: true
+            })
         }
     )
 
@@ -50,12 +55,23 @@ export function apply(ctx: Context, config: Config): void {
         authorsNoteCache.chatCount++
     })
 
-    ctx.on(
-        'chatluna/clear-chat-history',
-        async (conversationId, chatInterface) => {
-            cache.delete(conversationId)
-        }
-    )
+    const clear = (conversationId: string) => {
+        cache.delete(conversationId)
+        ctx.chatluna.contextManager.clearConversation(conversationId)
+    }
+
+    ctx.on('chatluna/after-conversation-clear-history', async (payload) => {
+        clear(payload.conversation.id)
+    })
+    ctx.on('chatluna/after-conversation-archive', async (payload) => {
+        clear(payload.conversation.id)
+    })
+    ctx.on('chatluna/after-conversation-restore', async (payload) => {
+        clear(payload.conversation.id)
+    })
+    ctx.on('chatluna/after-conversation-delete', async (payload) => {
+        clear(payload.conversation.id)
+    })
 }
 
 interface AuthorsNoteCache {

@@ -10,17 +10,28 @@ import { ChatLunaChatModel } from 'koishi-plugin-chatluna/llm-core/platform/mode
 import { BufferMemory } from 'koishi-plugin-chatluna/llm-core/memory/langchain'
 import { ChatLunaChatPrompt } from 'koishi-plugin-chatluna/llm-core/chain/prompt'
 import { PresetTemplate } from 'koishi-plugin-chatluna/llm-core/prompt'
+import type { ChatLunaPromptRenderService } from 'koishi-plugin-chatluna/services/chat'
+import type { ChatLunaContextManagerService } from 'koishi-plugin-chatluna/llm-core/prompt'
+import {
+    ChatLunaError,
+    ChatLunaErrorCode
+} from 'koishi-plugin-chatluna/utils/error'
+import { ComputedRef } from '@vue/reactivity'
+import { getMessageContent } from 'koishi-plugin-chatluna/utils/string'
+import type { AgentRunContext } from '../agent'
 
-export interface ChatHubChatChainInput {
+export interface ChatLunaChatChainInput {
     botName: string
-    preset: () => Promise<PresetTemplate>
+    preset: ComputedRef<PresetTemplate>
     humanMessagePrompt?: string
     historyMemory: BufferMemory
+    variableService: ChatLunaPromptRenderService
+    contextManager: ChatLunaContextManagerService
 }
 
-export class ChatHubChatChain
+export class ChatLunaChatChain
     extends ChatLunaLLMChainWrapper
-    implements ChatHubChatChainInput
+    implements ChatLunaChatChainInput
 {
     botName: string
 
@@ -28,14 +39,20 @@ export class ChatHubChatChain
 
     historyMemory: BufferMemory
 
-    preset: () => Promise<PresetTemplate>
+    preset: ComputedRef<PresetTemplate>
+
+    variableService: ChatLunaPromptRenderService
+
+    contextManager: ChatLunaContextManagerService
 
     constructor({
         botName,
         historyMemory,
         preset,
-        chain
-    }: ChatHubChatChainInput & {
+        chain,
+        variableService,
+        contextManager
+    }: ChatLunaChatChainInput & {
         chain: ChatLunaLLMChain
     }) {
         super()
@@ -43,26 +60,38 @@ export class ChatHubChatChain
 
         this.historyMemory = historyMemory
         this.preset = preset
+        this.variableService = variableService
+        this.contextManager = contextManager
         this.chain = chain
     }
 
     static fromLLM(
         llm: ChatLunaChatModel,
-        { botName, historyMemory, preset }: ChatHubChatChainInput
+        {
+            botName,
+            historyMemory,
+            preset,
+            variableService,
+            contextManager
+        }: ChatLunaChatChainInput
     ): ChatLunaLLMChainWrapper {
         const prompt = new ChatLunaChatPrompt({
             preset,
             tokenCounter: (text) => llm.getNumTokens(text),
             sendTokenLimit:
                 llm.invocationParams().maxTokenLimit ??
-                llm.getModelMaxContextSize()
+                llm.getModelMaxContextSize(),
+            promptRenderService: variableService,
+            contextManager
         })
 
         const chain = new ChatLunaLLMChain({ llm, prompt })
 
-        return new ChatHubChatChain({
+        return new ChatLunaChatChain({
             botName,
             historyMemory,
+            variableService,
+            contextManager,
             preset,
             chain
         })
@@ -72,9 +101,15 @@ export class ChatHubChatChain
         message,
         stream,
         events,
+        session,
         conversationId,
+        requestId,
+        source,
         variables,
-        signal
+        signal,
+        maxToken,
+        maxTokenLimit,
+        callbacks
     }: ChatLunaLLMCallArg): Promise<ChainValues> {
         const requests: ChainValues = {
             input: message
@@ -83,7 +118,33 @@ export class ChatHubChatChain
             await this.historyMemory.loadMemoryVariables(requests)
 
         requests['chat_history'] = chatHistory[this.historyMemory.memoryKey]
-        requests['variables'] = variables ?? {}
+        requests['variables'] = Object.assign(variables ?? {}, {
+            prompt: getMessageContent(message.content)
+        })
+        requests['variables']['built'] = {
+            conversationId,
+            requestId,
+            userId: session.userId,
+            guildId: session.guildId,
+            channelId: session.channelId,
+            chatPlatform: session.platform
+        }
+        requests['variables_hide'] = requests['variables']
+        const agentContext = {
+            kind: 'main' as const,
+            agentId: conversationId,
+            agentName: this.botName,
+            conversationId,
+            requestId,
+            source: source ?? 'chatluna',
+            userId: session.userId,
+            guildId: session.guildId,
+            channelId: session.channelId
+        } satisfies AgentRunContext
+        requests['configurable'] = {
+            session,
+            agentContext
+        }
         requests['id'] = conversationId
 
         const response = await callChatLunaChain(
@@ -91,18 +152,22 @@ export class ChatHubChatChain
             {
                 ...requests,
                 stream,
+                maxTokens: maxToken,
+                maxTokenLimit,
                 signal
             },
-            events
+            events,
+            callbacks
         )
 
-        if (response.text == null) {
-            throw new Error('response.text is null')
+        if (response == null || response.text == null) {
+            throw new ChatLunaError(
+                ChatLunaErrorCode.API_REQUEST_FAILED,
+                new Error(`No response from LLM: ${JSON.stringify(response)}`)
+            )
         }
 
-        const responseString = response.text
-
-        const aiMessage = new AIMessage(responseString)
+        const aiMessage = response.message ?? new AIMessage(response.text)
 
         response.message = aiMessage
 

@@ -1,87 +1,92 @@
 import { BaseChatMessageHistory } from '@langchain/core/chat_history'
 import { Embeddings } from '@langchain/core/embeddings'
+import { AIMessage, HumanMessage } from '@langchain/core/messages'
 import { ChainValues } from '@langchain/core/utils/types'
-import { Context } from 'koishi'
+import { computed, ComputedRef } from '@vue/reactivity'
+import { Context, Session } from 'koishi'
 import { parseRawModelName } from 'koishi-plugin-chatluna/llm-core/utils/count_tokens'
 import { BufferMemory } from 'koishi-plugin-chatluna/llm-core/memory/langchain'
 import { logger } from 'koishi-plugin-chatluna'
-import { ConversationRoom } from '../../types'
+import { KoishiChatMessageHistory } from 'koishi-plugin-chatluna/llm-core/memory/message'
+import { ChatLunaChatModel } from 'koishi-plugin-chatluna/llm-core/platform/model'
+import { ModelInfo } from 'koishi-plugin-chatluna/llm-core/platform/types'
+import { PresetTemplate } from 'koishi-plugin-chatluna/llm-core/prompt'
+import { getMessageContent } from 'koishi-plugin-chatluna/utils/string'
+import type { HandlerResult } from '../../utils/types'
 import {
     ChatLunaError,
     ChatLunaErrorCode
 } from 'koishi-plugin-chatluna/utils/error'
 import { ChatLunaLLMCallArg, ChatLunaLLMChainWrapper } from '../chain/base'
-import { KoishiChatMessageHistory } from 'koishi-plugin-chatluna/llm-core/memory/message'
-import { emptyEmbeddings } from 'koishi-plugin-chatluna/llm-core/model/in_memory'
 import {
-    PlatformEmbeddingsClient,
-    PlatformModelAndEmbeddingsClient,
-    PlatformModelClient
-} from 'koishi-plugin-chatluna/llm-core/platform/client'
+    createDisplayResponse,
+    initEmbeddings,
+    initModel,
+    supportChatMode
+} from './helper'
 import {
-    ClientConfig,
-    ClientConfigWrapper
-} from 'koishi-plugin-chatluna/llm-core/platform/config'
-import {
-    ChatHubBaseEmbeddings,
-    ChatLunaChatModel
-} from 'koishi-plugin-chatluna/llm-core/platform/model'
-import { PlatformService } from 'koishi-plugin-chatluna/llm-core/platform/service'
-import { ModelInfo } from 'koishi-plugin-chatluna/llm-core/platform/types'
-import { AIMessage, HumanMessage } from '@langchain/core/messages'
-import { PresetTemplate } from 'koishi-plugin-chatluna/llm-core/prompt'
-import { getMessageContent } from 'koishi-plugin-chatluna/utils/string'
-import type { HandlerResult } from '../../utils/types'
+    type CompressContextResult,
+    compressIfNeeded
+} from './infinite_context'
+import type {
+    ArchiveRecord,
+    BindingRecord,
+    ConstraintRecord,
+    ConversationRecord
+} from '../../types'
+import type { ChatLunaService } from '../../services/chat'
 
 export class ChatInterface {
     private _input: ChatInterfaceInput
     private _chatHistory: KoishiChatMessageHistory
-    private _chains: Record<string, ChatLunaLLMChainWrapper> = {}
-    private _embeddings: Embeddings
+    private _chain: ComputedRef<ChatLunaLLMChainWrapper | undefined> | undefined
+    private _embeddings: ComputedRef<Embeddings>
 
-    private _errorCountsMap: Record<string, number[]> = {}
+    private _historyMemory?: BufferMemory
+
     private _chatCount = 0
 
     constructor(
         public ctx: Context,
-        input: ChatInterfaceInput
+        input: ChatInterfaceInput,
+        private readonly chatluna: ChatLunaService
     ) {
         this._input = input
+        ctx.on('dispose', () => this.dispose())
+    }
+
+    dispose() {
+        this._chain = undefined
+        this._embeddings = undefined
+        this._historyMemory = undefined
     }
 
     private async handleChatError(
+        arg: ChatLunaLLMCallArg,
+        wrapper: ChatLunaLLMChainWrapper | undefined,
         error: unknown,
-        config: ClientConfigWrapper
-    ): Promise<never> {
-        const configMD5 = config.md5()
+        throwError = true
+    ): Promise<never | void> {
+        await this.ctx.parallel(
+            'chatluna/after-chat-error',
+            error as unknown as Error,
+            arg.conversationId,
+            arg.message,
+            arg.variables,
+            this,
+            wrapper,
+            arg.requestId
+        )
+
+        if (!throwError) {
+            return
+        }
 
         if (
             error instanceof ChatLunaError &&
             error.errorCode === ChatLunaErrorCode.API_UNSAFE_CONTENT
         ) {
             throw error
-        }
-
-        this._errorCountsMap[configMD5] = this._errorCountsMap[configMD5] ?? []
-        const errorTimes = this._errorCountsMap[configMD5]
-
-        // Add current error timestamp
-        errorTimes.push(Date.now())
-
-        // Keep only recent errors
-        if (errorTimes.length > config.value.maxRetries * 3) {
-            this._errorCountsMap[configMD5] = errorTimes.slice(
-                -config.value.maxRetries * 3
-            )
-        }
-
-        // Check if we need to disable the config
-        const recentErrors = errorTimes.slice(-config.value.maxRetries)
-        if (
-            recentErrors.length >= config.value.maxRetries &&
-            checkRange(recentErrors, 1000 * 60 * 20)
-        ) {
-            await this.disableConfig(config)
         }
 
         if (error instanceof ChatLunaError) {
@@ -91,37 +96,49 @@ export class ChatInterface {
         throw new ChatLunaError(ChatLunaErrorCode.UNKNOWN_ERROR, error as Error)
     }
 
-    private async disableConfig(config: ClientConfigWrapper): Promise<void> {
-        const configMD5 = config.md5()
-        delete this._chains[configMD5]
-        delete this._errorCountsMap[configMD5]
-
-        const service = this.ctx.chatluna.platform
-        await service.makeConfigStatus(config.value, false)
-    }
-
     async chat(arg: ChatLunaLLMCallArg): Promise<ChainValues> {
-        const [wrapper, config] = await this.createChatLunaLLMChainWrapper()
+        let wrapper: ChatLunaLLMChainWrapper
 
         try {
+            wrapper = await this.getChatLunaLLMChainWrapper()
+        } catch (error) {
+            await this.handleChatError(arg, wrapper, error)
+            throw error
+        }
+
+        try {
+            arg.variables = arg.variables ?? {}
             await this.ctx.parallel(
                 'chatluna/before-chat',
                 arg.conversationId,
                 arg.message,
                 arg.variables,
                 this,
-                wrapper
+                arg.session
             )
+        } catch (error) {
+            logger.error('Something went wrong when calling before-chat hook:')
+            logger.error(error)
+        }
 
+        try {
             const additionalArgs = await this._chatHistory.getAdditionalArgs()
+
+            arg.variables = arg.variables ?? {}
+
+            if (arg.postHandler?.variables) {
+                for (const key in arg.postHandler.variables) {
+                    arg.variables[key] = ''
+                }
+            }
+
             arg.variables = { ...additionalArgs, ...arg.variables }
 
             const response = await this.processChat(arg, wrapper)
 
-            delete this._errorCountsMap[config.md5()]
             return response
         } catch (error) {
-            await this.handleChatError(error, config)
+            await this.handleChatError(arg, wrapper, error)
         }
     }
 
@@ -129,73 +146,175 @@ export class ChatInterface {
         arg: ChatLunaLLMCallArg,
         wrapper: ChatLunaLLMChainWrapper
     ): Promise<ChainValues> {
-        const response = (await wrapper.call(arg)) as {
+        let hasSavedUser = false
+        const persist = arg.persist !== false
+
+        const saveUser = async () => {
+            if (hasSavedUser || !persist) {
+                return
+            }
+
+            await this._chatHistory.addMessage(arg.message)
+            hasSavedUser = true
+        }
+
+        // Compress chat history before starting
+        if (
+            persist &&
+            this.chatluna.currentConfig.infiniteContext &&
+            this._chatHistory
+        ) {
+            try {
+                const result = await compressIfNeeded({
+                    chatHistory: this._chatHistory,
+                    model: wrapper.model,
+                    conversationId: this._input.conversationId,
+                    preset: this._input.preset,
+                    threshold:
+                        this.chatluna.currentConfig.infiniteContextThreshold,
+                    signal: arg.signal
+                })
+                if (result?.messages) {
+                    await this._chatHistory.replaceMessages(result.messages)
+                }
+                if (result?.compressed) {
+                    await this.chatluna.conversation.recordCompression(
+                        this._input.conversationId,
+                        result
+                    )
+                }
+            } catch (error) {
+                logger.error('Error compressing context:', error)
+            }
+        }
+
+        const response = (await wrapper.call({
+            ...arg,
+            maxToken: this.preset?.value?.config?.maxOutputToken,
+            messageQueue: arg.messageQueue,
+            onAgentEvent: async (event) => {
+                if (event.type === 'tool-result') {
+                    if (persist) {
+                        await saveUser()
+                        await this._chatHistory.addAgentToolBatch(event.steps)
+                    }
+                }
+
+                if (event.type === 'human-update') {
+                    if (persist) {
+                        await saveUser()
+                        await this._chatHistory.addMessages(event.messages)
+                    }
+                }
+
+                await arg.onAgentEvent?.(event)
+            }
+        })) as {
             message: AIMessage
         } & ChainValues
+
+        const responseMessage = response.message
+
+        const displayResponse = createDisplayResponse(responseMessage)
+
         this._chatCount++
 
         // Handle post-processing if needed
         if (arg.postHandler) {
-            const handlerResult = await this.handlePostProcessing(arg, response)
-            response.message.content = handlerResult.displayContent
-            await this._chatHistory.overrideAdditionalArgs(
-                handlerResult.variables
+            const handlerResult = await this.handlePostProcessing(
+                arg,
+                displayResponse
             )
+            displayResponse.content = handlerResult.displayContent
+            if (persist) {
+                await this._chatHistory.overrideAdditionalArgs(
+                    handlerResult.variables
+                )
+            }
         }
 
-        const messageContent = getMessageContent(response.message.content)
+        const messageContent = getMessageContent(displayResponse.content)
 
         // Update chat history
-        if (messageContent.trim().length > 0) {
-            await this.chatHistory.addMessage(arg.message)
-            await this.chatHistory.addMessage(response.message)
+        if (messageContent.trim().length > 0 && persist) {
+            await saveUser()
+            let saveMessage = responseMessage
+            if (!this.chatluna.currentConfig.rawOnCensor) {
+                saveMessage = displayResponse
+            }
+
+            await this._chatHistory.addMessage(saveMessage)
         }
 
-        // Process response
-        this.ctx.parallel(
-            'chatluna/after-chat',
-            arg.conversationId,
-            arg.message,
-            response.message as AIMessage,
-            { ...arg.variables, chatCount: this._chatCount },
-            this,
-            wrapper
-        )
+        try {
+            await this.ctx.parallel(
+                'chatluna/after-chat',
+                arg.conversationId,
+                arg.message,
+                displayResponse as AIMessage,
+                { ...arg.variables, chatCount: this._chatCount },
+                this,
+                arg.session
+            )
+        } catch (error) {
+            await this.handleChatError(arg, wrapper, error, false)
+        }
 
-        return response
+        if (persist && this._input.autoTitle !== false) {
+            autoSummarizeTitle(
+                this.chatluna,
+                arg.conversationId,
+                wrapper,
+                arg.message,
+                displayResponse as AIMessage
+            ).catch((e) => logger.error('autoSummarizeTitle error:', e))
+        }
+
+        return { message: displayResponse }
     }
 
     private async handlePostProcessing(
         arg: ChatLunaLLMCallArg,
-        response: { message: AIMessage } & ChainValues
+        message: AIMessage
     ): Promise<HandlerResult> {
-        logger.debug(`original content: %c`, response.message.content)
+        logger.debug(`Original content: %c`, message.content)
 
         return await arg.postHandler.handler(
             arg.session,
-            getMessageContent(response.message.content)
+            getMessageContent(message.content)
         )
     }
 
-    async createChatLunaLLMChainWrapper(): Promise<
-        [ChatLunaLLMChainWrapper, ClientConfigWrapper]
-    > {
-        const service = this.ctx.chatluna.platform
-        const [llmPlatform, llmModelName] = parseRawModelName(this._input.model)
-        const currentLLMConfig = await service.randomConfig(llmPlatform)
-
-        if (this._chains[currentLLMConfig.md5()]) {
-            return [this._chains[currentLLMConfig.md5()], currentLLMConfig]
+    async getChatLunaLLMChainWrapper(): Promise<ChatLunaLLMChainWrapper> {
+        if (this._chain) {
+            const chainValue = this._chain.value
+            if (chainValue) {
+                return chainValue
+            }
         }
 
-        let embeddings: Embeddings
+        await this.createChatLunaLLMChainWrapper()
+        return this._chain.value
+    }
 
-        let llm: ChatLunaChatModel
-        let modelInfo: ModelInfo
+    async createChatLunaLLMChainWrapper(): Promise<void> {
+        if (this._chain) {
+            return
+        }
+
+        const service = this.chatluna.platform
+        const [llmPlatform, llmModelName] = parseRawModelName(this._input.model)
+
+        let llm: ComputedRef<ChatLunaChatModel>
+
+        let modelInfo: ComputedRef<ModelInfo | undefined>
         let historyMemory: BufferMemory
 
         try {
-            embeddings = await this._initEmbeddings(service)
+            this._embeddings = await initEmbeddings(
+                service,
+                this._input.embeddings
+            )
         } catch (error) {
             if (error instanceof ChatLunaError) {
                 throw error
@@ -207,9 +326,9 @@ export class ChatInterface {
         }
 
         try {
-            ;[llm, modelInfo] = await this._initModel(
-                service,
-                currentLLMConfig.value,
+            ;[llm, modelInfo] = await initModel(
+                this.chatluna,
+                llmPlatform,
                 llmModelName
             )
         } catch (error) {
@@ -218,8 +337,6 @@ export class ChatInterface {
             }
             throw new ChatLunaError(ChatLunaErrorCode.MODEL_INIT_ERROR, error)
         }
-
-        embeddings = (await this._checkChatMode(modelInfo)) ?? embeddings
 
         try {
             await this._createChatHistory()
@@ -242,19 +359,22 @@ export class ChatInterface {
             throw new ChatLunaError(ChatLunaErrorCode.UNKNOWN_ERROR, error)
         }
 
-        const chatChain = await service.createChatChain(this._input.chatMode, {
-            botName: this._input.botName,
-            model: llm,
-            embeddings,
-            historyMemory,
-            preset: this._input.preset,
-            vectorStoreName: this._input.vectorStoreName
+        this._chain = computed(() => {
+            if (llm.value == null) {
+                return undefined
+            }
+            return service.createChatChain(this._input.chatMode, {
+                botName: this._input.botName,
+                model: llm.value,
+                embeddings: this._embeddings.value,
+                historyMemory,
+                preset: this._input.preset,
+                vectorStoreName: this._input.vectorStoreName,
+                supportChatChain:
+                    modelInfo?.value != null &&
+                    supportChatMode(modelInfo.value, this._input.chatMode)
+            })
         })
-
-        this._chains[currentLLMConfig.md5()] = chatChain
-        this._embeddings = embeddings
-
-        return [chatChain, currentLLMConfig]
     }
 
     get chatHistory(): BaseChatMessageHistory {
@@ -265,44 +385,12 @@ export class ChatInterface {
         return this._input.chatMode
     }
 
-    get embeddings(): Embeddings {
+    get embeddings(): ComputedRef<Embeddings> {
         return this._embeddings
     }
 
-    get preset(): Promise<PresetTemplate> {
-        return this._input.preset()
-    }
-
-    async delete(ctx: Context, room: ConversationRoom): Promise<void> {
-        await this.clearChatHistory()
-
-        for (const chain of Object.values(this._chains)) {
-            await chain.model.clearContext()
-        }
-
-        this._chains = {}
-
-        await ctx.database.remove('chathub_conversation', {
-            id: room.conversationId
-        })
-
-        await ctx.database.remove('chathub_room', {
-            roomId: room.roomId
-        })
-        await ctx.database.remove('chathub_room_member', {
-            roomId: room.roomId
-        })
-        await ctx.database.remove('chathub_room_group_member', {
-            roomId: room.roomId
-        })
-
-        await ctx.database.remove('chathub_user', {
-            defaultRoomId: room.roomId
-        })
-
-        await ctx.database.remove('chathub_message', {
-            conversation: room.conversationId
-        })
+    get preset(): ComputedRef<PresetTemplate> {
+        return this._input.preset
     }
 
     async clearChatHistory(): Promise<void> {
@@ -310,100 +398,42 @@ export class ChatInterface {
             await this._createChatHistory()
         }
 
-        await this.ctx.root.parallel(
-            'chatluna/clear-chat-history',
-            this._input.conversationId,
-            this
-        )
-
         await this._chatHistory.clear()
 
-        for (const chain of Object.values(this._chains)) {
-            await chain.model.clearContext()
-        }
+        await this._chain?.value?.model.clearContext(this._input.conversationId)
     }
 
-    private async _initEmbeddings(
-        service: PlatformService
-    ): Promise<ChatHubBaseEmbeddings> {
-        if (
-            this._input.embeddings == null ||
-            this._input.embeddings.length < 1 ||
-            this._input.embeddings === '无'
-        ) {
-            logger.warn(
-                'Embeddings are empty, falling back to fake embeddings. Try check your config.'
+    async compressContext(
+        force = false,
+        instruction?: string
+    ): Promise<CompressContextResult> {
+        const wrapper = await this.getChatLunaLLMChainWrapper()
+        if (!this._chatHistory) {
+            throw new ChatLunaError(
+                ChatLunaErrorCode.CHAT_HISTORY_INIT_ERROR,
+                new Error('Chat history is not initialized')
             )
-            return emptyEmbeddings
         }
 
-        const [platform, modelName] = parseRawModelName(this._input.embeddings)
-
-        logger.info(`init embeddings for %c`, this._input.embeddings)
-
-        const client = await service.randomClient(platform)
-
-        if (client == null || client instanceof PlatformModelClient) {
-            logger.warn(
-                `Platform ${platform} is not supported, falling back to fake embeddings`
+        const result = await compressIfNeeded({
+            chatHistory: this._chatHistory,
+            model: wrapper.model,
+            conversationId: this._input.conversationId,
+            preset: this._input.preset,
+            threshold: this.chatluna.currentConfig.infiniteContextThreshold,
+            force,
+            instruction
+        })
+        if (result.messages) {
+            await this._chatHistory.replaceMessages(result.messages)
+        }
+        if (result.compressed) {
+            await this.chatluna.conversation.recordCompression(
+                this._input.conversationId,
+                result
             )
-            return emptyEmbeddings
         }
-
-        if (client instanceof PlatformEmbeddingsClient) {
-            return client.createModel(modelName)
-        } else if (client instanceof PlatformModelAndEmbeddingsClient) {
-            const model = client.createModel(modelName)
-
-            if (model instanceof ChatLunaChatModel) {
-                logger.warn(
-                    `Model ${modelName} is not an embeddings model, falling back to fake embeddings`
-                )
-                return emptyEmbeddings
-            }
-
-            return model
-        }
-    }
-
-    private async _initModel(
-        service: PlatformService,
-        config: ClientConfig,
-        llmModelName: string
-    ): Promise<[ChatLunaChatModel, ModelInfo]> {
-        const platform = await service.getClient(config)
-
-        const llmInfo = (await platform.getModels()).find(
-            (model) => model.name === llmModelName
-        )
-
-        const llmModel = platform.createModel(llmModelName)
-
-        if (llmModel instanceof ChatLunaChatModel) {
-            return [llmModel, llmInfo]
-        }
-    }
-
-    private async _checkChatMode(modelInfo: ModelInfo) {
-        if (
-            // default check
-            (!modelInfo.supportMode?.includes(this._input.chatMode) &&
-                // all
-                !modelInfo.supportMode?.includes('all')) ||
-            // func call with plugin browsing
-            (!modelInfo.functionCall && this._input.chatMode === 'plugin')
-        ) {
-            logger.warn(
-                `Chat mode ${this._input.chatMode} is not supported by model ${this._input.model}, falling back to chat mode`
-            )
-
-            this._input.chatMode = 'chat'
-            const embeddings = emptyEmbeddings
-
-            return embeddings
-        }
-
-        return undefined
+        return result
     }
 
     private async _createChatHistory(): Promise<BaseChatMessageHistory> {
@@ -414,7 +444,8 @@ export class ChatInterface {
         this._chatHistory = new KoishiChatMessageHistory(
             this.ctx,
             this._input.conversationId,
-            this._input.maxMessagesCount
+            10000,
+            this.chatluna
         )
 
         await this._chatHistory.loadConversation()
@@ -423,7 +454,11 @@ export class ChatInterface {
     }
 
     private _createHistoryMemory() {
-        return new BufferMemory({
+        if (this._historyMemory) {
+            return this._historyMemory
+        }
+
+        this._historyMemory = new BufferMemory({
             returnMessages: true,
             inputKey: 'input',
             outputKey: 'output',
@@ -431,25 +466,75 @@ export class ChatInterface {
             humanPrefix: 'user',
             aiPrefix: this._input.botName
         })
+
+        return this._historyMemory
+    }
+}
+
+async function autoSummarizeTitle(
+    chatluna: ChatLunaService,
+    conversationId: string,
+    wrapper: ChatLunaLLMChainWrapper,
+    humanMsg: HumanMessage,
+    aiMsg: AIMessage
+) {
+    const claimed = await chatluna.conversation.claimAutoTitle(conversationId)
+    if (!claimed) {
+        return
+    }
+
+    const humanContent = getMessageContent(humanMsg.content)
+    const aiContent = getMessageContent(aiMsg.content)
+
+    const prompt =
+        `Generate a concise title for the following conversation.\n` +
+        `Requirements:\n` +
+        `- Length: 5 to 20 characters\n` +
+        `- Use the same language as the user's message\n` +
+        `- Output ONLY the title, no punctuation, no quotes, no explanation\n\n` +
+        `User: ${humanContent}\n` +
+        `Assistant: ${aiContent}`
+
+    try {
+        const result = await wrapper.model.invoke([new HumanMessage(prompt)], {
+            configurable: {
+                id: conversationId
+            },
+            id: conversationId,
+            variables_hide: {
+                built: {
+                    conversationId
+                }
+            }
+        })
+        const title = getMessageContent(result.content).trim().slice(0, 20)
+
+        if (!title) {
+            return
+        }
+
+        await chatluna.conversation.touchConversation(conversationId, {
+            title,
+            autoTitle: false
+        })
+    } catch (error) {
+        logger.error(error)
+        await chatluna.conversation.touchConversation(conversationId, {
+            autoTitle: true
+        })
+        throw error
     }
 }
 
 export interface ChatInterfaceInput {
     chatMode: string
+    autoTitle?: boolean
     botName?: string
-    preset?: () => Promise<PresetTemplate>
+    preset?: ComputedRef<PresetTemplate>
     model: string
     embeddings?: string
     vectorStoreName?: string
     conversationId: string
-    maxMessagesCount: number
-}
-
-function checkRange(times: number[], delayTime: number) {
-    const first = times[0]
-    const last = times[times.length - 1]
-
-    return last - first < delayTime
 }
 
 declare module 'koishi' {
@@ -459,7 +544,7 @@ declare module 'koishi' {
             message: HumanMessage,
             promptVariables: ChainValues,
             chatInterface: ChatInterface,
-            chain: ChatLunaLLMChainWrapper
+            session: Session
         ) => Promise<void>
         'chatluna/after-chat': (
             conversationId: string,
@@ -467,11 +552,86 @@ declare module 'koishi' {
             responseMessage: AIMessage,
             promptVariables: ChainValues,
             chatInterface: ChatInterface,
-            chain: ChatLunaLLMChainWrapper
+            session: Session
         ) => Promise<void>
+        'chatluna/before-conversation-create': (payload: {
+            conversation: ConversationRecord
+            bindingKey: string
+        }) => Promise<void>
+        'chatluna/after-conversation-create': (payload: {
+            conversation: ConversationRecord
+            bindingKey: string
+        }) => Promise<void>
+        'chatluna/before-conversation-switch': (payload: {
+            bindingKey: string
+            conversation: ConversationRecord
+            previousConversation?: ConversationRecord | null
+        }) => Promise<void>
+        'chatluna/after-conversation-switch': (payload: {
+            bindingKey: string
+            conversation: ConversationRecord
+            previousConversation?: ConversationRecord | null
+        }) => Promise<void>
+        'chatluna/after-binding-update': (payload: {
+            binding: BindingRecord
+            previousConversationId?: string | null
+        }) => Promise<void>
+        'chatluna/after-constraint-update': (payload: {
+            constraint: ConstraintRecord
+        }) => Promise<void>
+        'chatluna/before-conversation-archive': (payload: {
+            conversation: ConversationRecord
+        }) => Promise<void>
+        'chatluna/after-conversation-archive': (payload: {
+            conversation: ConversationRecord
+            archive: ArchiveRecord
+            path: string
+        }) => Promise<void>
+        'chatluna/before-conversation-restore': (payload: {
+            conversation: ConversationRecord
+            archive: ArchiveRecord
+        }) => Promise<void>
+        'chatluna/after-conversation-restore': (payload: {
+            conversation: ConversationRecord
+            archive: ArchiveRecord
+        }) => Promise<void>
+        'chatluna/before-conversation-delete': (payload: {
+            conversation: ConversationRecord
+        }) => Promise<void>
+        'chatluna/after-conversation-delete': (payload: {
+            conversation: ConversationRecord
+        }) => Promise<void>
+        'chatluna/before-conversation-clear-history': (payload: {
+            conversation: ConversationRecord
+            chatInterface: ChatInterface
+        }) => Promise<void>
         'chatluna/clear-chat-history': (
             conversationId: string,
             chatInterface: ChatInterface
+        ) => Promise<void>
+        'chatluna/after-conversation-clear-history': (payload: {
+            conversation: ConversationRecord
+            chatInterface: ChatInterface
+        }) => Promise<void>
+        'chatluna/before-conversation-cache-clear': (payload: {
+            conversation: ConversationRecord
+            chatInterface?: ChatInterface
+        }) => Promise<void>
+        'chatluna/after-conversation-cache-clear': (payload: {
+            conversation: ConversationRecord
+        }) => Promise<void>
+        'chatluna/conversation-compressed': (payload: {
+            conversation: ConversationRecord
+            result: CompressContextResult
+        }) => Promise<void>
+        'chatluna/after-chat-error': (
+            error: Error,
+            conversationId: string,
+            sourceMessage: HumanMessage,
+            promptVariables: ChainValues,
+            chatInterface: ChatInterface,
+            chain?: ChatLunaLLMChainWrapper,
+            requestId?: string
         ) => Promise<void>
     }
 }

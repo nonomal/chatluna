@@ -1,0 +1,270 @@
+import { Context } from 'koishi'
+import { PlatformModelAndEmbeddingsClient } from 'koishi-plugin-chatluna/llm-core/platform/client'
+import {
+    ChatLunaBaseEmbeddings,
+    ChatLunaChatModel,
+    ChatLunaEmbeddings
+} from 'koishi-plugin-chatluna/llm-core/platform/model'
+import {
+    ModelCapabilities,
+    ModelInfo,
+    ModelType
+} from 'koishi-plugin-chatluna/llm-core/platform/types'
+import {
+    ChatLunaError,
+    ChatLunaErrorCode
+} from 'koishi-plugin-chatluna/utils/error'
+import { Config, logger } from '.'
+import { QWenRequester } from './requester'
+import { ChatLunaPlugin } from 'koishi-plugin-chatluna/services/chat'
+import { expandReasoningEffortModelVariants } from '@chatluna/v1-shared-adapter'
+
+import type { ModelUsageReporter } from 'koishi-plugin-chatluna/llm-core/platform/usage'
+
+export class QWenClient extends PlatformModelAndEmbeddingsClient {
+    platform = 'qwen'
+
+    private _requester: QWenRequester
+
+    constructor(
+        ctx: Context,
+        private _config: Config,
+        public plugin: ChatLunaPlugin
+    ) {
+        super(ctx, plugin.platformConfigPool)
+
+        this._requester = new QWenRequester(
+            ctx,
+            plugin.platformConfigPool,
+            _config,
+            plugin
+        )
+    }
+
+    async refreshModels(): Promise<ModelInfo[]> {
+        // thinking -> ''
+        // default -> thinking
+        const rawModels: [string, number | undefined][] = [
+            ['qwen-turbo', 100000],
+            ['qwen-long', 1_000_000],
+            ['qwen-plus', 131072],
+            ['qwen-plus-character', 32768],
+            ['qwen-max', 30720],
+            ['qwen-max-latest', 131_072],
+            ['qwen3.5-plus', 1_000_000],
+            ['qwen3.5-plus-2026-02-15', 1_000_000],
+            ['qwen3.6-27b', 262_144],
+            ['qwen3.6-35b-a3b', 262_144],
+            ['qwen3.6-flash', 1_000_000],
+            ['qwen3.6-flash-2026-04-16', 1_000_000],
+            ['qwen3.6-max-preview', 262_144],
+            ['qwen3.6-plus', 1_000_000],
+            ['qwen3.6-plus-2026-04-02', 1_000_000],
+            ['qwen3.7-flash', 1_000_000],
+            ['qwen3.7-flash-2026-07-15', 1_000_000],
+            ['qwen3.7-max', 1_000_000],
+            ['qwen3.7-max-2026-05-17', 1_000_000],
+            ['qwen3.7-max-2026-05-20', 1_000_000],
+            ['qwen3.7-max-2026-06-08', 1_000_000],
+            ['qwen3.7-max-preview', 1_000_000],
+            ['qwen3.7-plus', 1_000_000],
+            ['qwen3.7-plus-2026-05-26', 1_000_000],
+            ['qwen3.8-2.4t-a95b', 1_000_000],
+            ['qwen3.8-27b', 1_000_000],
+            ['qwen3.8-flash', 1_000_000],
+            ['qwen3.8-max', 1_000_000],
+            ['qwen3.8-max-preview', 1_000_000],
+            ['qwen3.8-plus', 1_000_000],
+            ['qwen3-max', 262_144],
+            ['qwen3-max-2026-01-23-thinking', 262_144],
+            ['qwen3-max-2026-01-23-non-thinking', 262_144],
+            ['qwen-plus-latest-non-thinking', 1_000_000],
+            ['qwen-plus-latest-thinking', 1_000_000],
+            ['qwen-turbo-latest-non-thinking', 1_000_000],
+            ['qwen-turbo-latest-thinking', 1_000_000],
+            ['qwen-flash', 1_000_000],
+            ['qwen3-vl-plus-thinking', 262_144],
+            ['qwen3-vl-plus-non-thinking', 262_144],
+            ['qwen-vl-max', 131_072],
+            ['qwen-vl-max-latest', 131_072],
+            ['qwen-vl-plus', 131_072],
+            ['qwen-vl-plus-latest', 131_072],
+            ['qwen-vl-ocr', 34096],
+            ['qwen-vl-ocr-latest', 34096],
+            ['qwq-32b-preview', 30720],
+            ['qvq-72b-preview', 30720],
+            ['qwq-plus', 131072],
+            ['qwq-plus-latest', 131072],
+            ['qwen-omni-turbo', 32768],
+            ['qwen-omni-turbo-latest', 32768],
+            ['qwen-math-plus', 4000],
+            ['qwen-math-turbo', 4000],
+            ['qwen3-next-80b-a3b-default', 126_976],
+            ['qwen3-next-80b-a3b-instruct', 126_024],
+            ['qwen3-235b-a22b-default-2507', 131072],
+            ['qwen3-235b-a22b-instruct-2507', 131072],
+            ['qwen3-32b-thinking', 131072],
+            ['qwen3-32b-non-thinking', 131072],
+            ['qwen3-30b-a3b-thinking', 131072],
+            ['qwen3-30b-a3b-non-thinking', 131072],
+            ['qwen3-14b-thinking', 131072],
+            ['qwen3-14b-non-thinking', 131072],
+            ['qwen3-8b-thinking', 131072],
+            ['qwen3-8b-non-thinking', 131072],
+            ['qwen3-4b-thinking', 131072],
+            ['qwen3-4b-non-thinking', 131072],
+            ['qwen3-1.7b-thinking', 30720],
+            ['qwen3-1.7b-non-thinking', 30720],
+            ['qwen3-0.6b-thinking', 30720],
+            ['qwen3-0.6b-non-thinking', 30720],
+            ['qwen3-omni-flash-thinking', 65536],
+            ['qwen3-omni-flash-non-thinking', 65536],
+            ['qwen-omni-turbo', 32768],
+            ['qwen-omni-latest', 32768],
+            ['qwen3-vl-235b-a22b-default', 131072],
+            ['qwen3-vl-235b-a22b-instruct', 131072],
+            ['qwen2.5-vl-72b-instruct', 131072],
+            ['qwen2.5-vl-32b-instruct', 129024],
+            ['qwen2.5-vl-7b-instruct', 8192],
+            ['qwen2.5-vl-3b-instruct', 8192],
+            ['qwen-vl-v1', 8000],
+            ['Moonshot-Kimi-K2-Instruct', 131072],
+            ['deepseek-r1', 131072],
+            ['deepseek-v3', 65536],
+            ['text-embedding-v1', 2048],
+            ['text-embedding-v2', 2048],
+            ['text-embedding-v3', 8192]
+        ] as [string, number][]
+
+        const reasoningEffortModels = [
+            'qwen3.5-plus',
+            'qwen3.5-plus-2026-02-15'
+        ]
+
+        const imageInputSupportModels = [
+            'vl',
+            'omni',
+            'vision',
+            'qvq',
+            'qwen3.5'
+        ]
+
+        const expandedModels = rawModels.flatMap(([model, token]) => {
+            const result: [string, number | undefined][] = [[model, token]]
+            if (reasoningEffortModels.includes(model)) {
+                for (const variant of expandReasoningEffortModelVariants(
+                    model,
+                    ['non-thinking', 'thinking']
+                )) {
+                    result.push([variant, token])
+                }
+            }
+            return result
+        })
+
+        const additionalModels = this._config.additionalModels.map(
+            ({ model, modelType, contextSize, modelCapabilities }) => {
+                const type =
+                    modelType === 'Embeddings 嵌入模型'
+                        ? ModelType.embeddings
+                        : ModelType.llm
+
+                return {
+                    name: model,
+                    type,
+                    capabilities:
+                        type === ModelType.llm
+                            ? modelCapabilities
+                            : modelCapabilities.filter(
+                                  (cap) => cap !== ModelCapabilities.ToolCall
+                              ),
+                    maxTokens: contextSize ?? 4096
+                } as ModelInfo
+            }
+        )
+
+        return expandedModels
+            .map(([model, token]) => {
+                const type = model.includes('embedding')
+                    ? ModelType.embeddings
+                    : ModelType.llm
+
+                return {
+                    name: model,
+                    type,
+                    maxTokens: token,
+                    capabilities: [
+                        type === ModelType.llm &&
+                            (model.includes('qwen-plus') ||
+                                model.includes('qwen-max') ||
+                                model.includes('qwen-turbo') ||
+                                model.includes('qwen3') ||
+                                model.includes('qwen2.5') ||
+                                model.includes('omni') ||
+                                model.includes('Kimi-K2') ||
+                                model.includes('deepseek')) &&
+                            ModelCapabilities.ToolCall,
+                        (imageInputSupportModels.some((pattern) =>
+                            model.includes(pattern)
+                        ) ||
+                            (model.includes('qwen3.6') &&
+                                !model.includes('-max')) ||
+                            model.includes('qwen3.7') ||
+                            model.includes('qwen3.8')) &&
+                            ModelCapabilities.ImageInput,
+                        (model.includes('qwen3.7') ||
+                            model.includes('qwen3.8')) &&
+                            ModelCapabilities.VideoInput
+                    ].filter(Boolean)
+                } as ModelInfo
+            })
+            .concat(additionalModels)
+    }
+
+    protected _createModel(
+        model: string,
+        report: ModelUsageReporter
+    ): ChatLunaChatModel | ChatLunaBaseEmbeddings {
+        const info = this._modelInfos[model]
+
+        if (info == null) {
+            logger.warn(
+                `Model ${model} not found`,
+                JSON.stringify(this._modelInfos)
+            )
+            throw new ChatLunaError(ChatLunaErrorCode.MODEL_NOT_FOUND)
+        }
+
+        if (info.type === ModelType.llm) {
+            const modelMaxContextSize = info.maxTokens
+            return new ChatLunaChatModel({
+                usageReporter: report,
+                modelInfo: info,
+                requester: this._requester,
+                model,
+                modelMaxContextSize,
+                maxTokenLimit: Math.floor(
+                    (info.maxTokens || modelMaxContextSize || 128_000) *
+                        this._config.maxContextRatio
+                ),
+                timeout: this._config.timeout,
+                temperature: this._config.temperature,
+                maxRetries: this._config.maxRetries,
+                llmType: 'qwen',
+                isThinkModel:
+                    model.includes('reasoner') ||
+                    model.includes('r1') ||
+                    model.includes('thinking') ||
+                    model.includes('qwq')
+            })
+        }
+
+        return new ChatLunaEmbeddings({
+            usageReporter: report,
+            client: this._requester,
+            model: info.name,
+            batchSize: 5,
+            maxRetries: this._config.maxRetries
+        })
+    }
+}

@@ -1,0 +1,42 @@
+$inner:
+    - {}
+    - $desc: 'API Configuration'
+      platform: 'Adapter platform name. (Do not modify if you do not understand)'
+      pullModels: 'Auto-fetch model list. If disabled, use only specified models.'
+      additionalModels:
+          $desc: 'Additional model list.'
+          $inner:
+              model: 'Model name.'
+              modelType: 'Model type.'
+              contextSize: 'Context size.'
+              modelCapabilities:
+                $desc: 'Model capabilities.'
+                $inner:
+                    - 'Text input'
+                    - 'Tool calling'
+                    - 'Visual image input'
+                    - 'Image generation'
+                    - 'Audio input'
+                    - 'Video input'
+                    - 'File input'
+      apiKeys:
+          $inner:
+              - 'Gemini API Key'
+              - 'Gemini API Endpoint (optional)'
+              - 'Enabled'
+          $desc: 'Gemini API access credentials'
+
+    - $desc: 'Model Parameters'
+      maxContextRatio: 'Maximum context usage ratio (0-1). Controls the maximum percentage of model context window available for use. For example, 0.35 means at most 35% of the model context can be used.'
+      temperature: 'Sampling temperature (0-2). Higher: more random, Lower: more deterministic'
+      googleSearch: 'Enable Google search'
+      thinkingBudget: 'Thinking budget (-1-24576). (0: dynamic thinking) Higher: more tokens spent on thinking. Currently only supports `gemini-2.5` series models.'
+      groundingContentDisplay: 'Enable display of search results'
+      imageGeneration: 'Enable image generation (only for `gemini-*-image-*` and `gemini-2.5-flash-image-preview` model)'
+      imageModelSearch: 'Enable search for image generation models. When enabled, supported image models will generate additional variants with a `-search` suffix (e.g. `gemini-3-pro-image-search`).'
+      includeThoughts: 'Enable retrieval of model thoughts'
+      codeExecution: 'Enable code execution tool'
+      urlContext: 'Enable URL context retrieval tool'
+      useCamelCaseSystemInstruction: 'Use camelCase systemInstruction instead of snake_case system_instruction'
+      useCamelCaseMediaFields: 'Use camelCase inlineData and mimeType instead of snake_case inline_data and mime_type'
+      nonStreaming: 'Force disable streaming response. When enabled, requests will always be made in non-streaming mode, even if the stream parameter is configured.'

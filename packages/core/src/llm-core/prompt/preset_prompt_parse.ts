@@ -3,6 +3,7 @@ import {
     BaseMessage,
     BaseMessageFields,
     HumanMessage,
+    MessageContentComplex,
     SystemMessage
 } from '@langchain/core/messages'
 import { load } from 'js-yaml'
@@ -18,14 +19,15 @@ import {
 export function loadPreset(rawText: string): PresetTemplate {
     try {
         return loadYamlPreset(rawText)
-    } catch {
-        return loadTxtPreset(rawText)
+    } catch (e) {
+        logger.error(e)
+        throw e
     }
 }
 
 function createMessage(
     role: string,
-    content: string,
+    content: string | MessageContentComplex[],
     type?: string
 ): BaseMessage {
     if (content == null) {
@@ -33,7 +35,7 @@ function createMessage(
     }
 
     const fields: BaseMessageFields = {
-        content: content.trim(),
+        content: typeof content === 'string' ? content.trim() : content,
         additional_kwargs: { type }
     }
 
@@ -55,13 +57,17 @@ function createMessage(
 function loadYamlPreset(rawText: string): PresetTemplate {
     const rawJson = load(rawText) as RawPreset
 
+    if (!rawJson) {
+        return EMPTY_PRESET
+    }
+
     let loreBooks: PresetTemplate['loreBooks'] | undefined = {
         items: []
     }
 
     let authorsNote: PresetTemplate['authorsNote'] | undefined
 
-    if (rawJson.world_lores) {
+    if (rawJson.world_lores && Array.isArray(rawJson.world_lores)) {
         const config = rawJson.world_lores.find(
             isRoleBookConfig
         ) as RoleBookConfig
@@ -104,49 +110,16 @@ function loadYamlPreset(rawText: string): PresetTemplate {
     }
 }
 
-function loadTxtPreset(rawText: string): PresetTemplate {
-    const triggerKeyword: string[] = []
-    const messages: BaseMessage[] = []
-    let formatUserPromptString = '{prompt}'
-
-    logger?.warn(
-        'TXT Preset is deprecated and will be removed in 1.0. ' +
-            'Please migrate to YAML preset format. ' +
-            'For more migrate information, visit: https://chatluna.chat/guide/preset-system/introduction.html'
-    )
-
-    // crlf support
-    const chunks = rawText
-        .replace(/#.*\r?\n/g, '')
-        .replace(/\r\n/g, '\n')
-        .split(/\n\n/)
-
-    for (const chunk of chunks) {
-        const match = chunk.match(/^\s*([a-zA-Z_]+)\s*:\s*(.*)$/s)
-        if (!match) continue
-
-        const [, role, content] = match
-
-        if (role === 'keyword') {
-            triggerKeyword.push(...content.split(',').map((k) => k.trim()))
-        } else if (role === 'format_user_prompt') {
-            formatUserPromptString = content.trim()
-        } else {
-            messages.push(createMessage(role, content))
-        }
-    }
-
-    if (triggerKeyword.length === 0) throw new Error('No trigger keyword found')
-    if (messages.length === 0) throw new Error('No preset messages found')
-
-    return {
-        rawText,
-        triggerKeyword,
-        messages,
-        formatUserPromptString,
-        config: {}
-    }
+export const EMPTY_PRESET: PresetTemplate = {
+    triggerKeyword: [],
+    messages: [],
+    rawText: '',
+    formatUserPromptString: '',
+    loreBooks: undefined,
+    authorsNote: undefined,
+    knowledge: undefined,
+    version: undefined,
+    config: {}
 }
 
-export * from './format'
 export * from './type'

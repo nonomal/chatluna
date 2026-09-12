@@ -1,30 +1,42 @@
 import { Awaitable, Computed, Schema, Time } from 'koishi'
 
 export interface Config {
-    botName: string
+    botNames: string[]
     isNickname: boolean
+    isNickNameWithContent: boolean
     allowPrivate: boolean
     isForwardMsg: boolean
-    allowChatWithRoomName: boolean
+    forwardMsgMinLength: number
     msgCooldown: number
-    randomReplyFrequency: number
-    messageCount: number
+    randomReplyFrequency: Computed<Awaitable<number>>
+    includeQuoteReply: boolean
+    attachForwardMsgIdToContext: boolean
+    autoUpdateConversationModel: boolean
     isLog: boolean
 
     isReplyWithAt: boolean
+    replyQuoteThreshold?: number
     allowQuoteReply: boolean
-    proxyAddress: string
+    proxyAddress?: string
     isProxy: boolean
     outputMode: string
     sendThinkingMessage: boolean
     sendThinkingMessageTimeout: number
     showThoughtMessage: boolean
-    splitMessage: boolean
-    blackList: Computed<Awaitable<boolean>>
+    splitMessage: 'none' | 'punctuation' | 'paragraph'
+    blackList: Computed<Awaitable<number>>
     censor: boolean
-    autoDelete: boolean
-    autoDeleteTimeout: number
-    messageDelay: number
+    autoArchive: boolean
+    autoArchiveTimeout: number
+    autoPurgeArchive: boolean
+    autoPurgeArchiveTimeout: number
+    messageQueue: boolean
+    messageQueueDelay: number
+    agentTaskAutoWakeup: boolean
+    infiniteContext: boolean
+    infiniteContextThreshold: number
+    rawOnCensor: boolean
+    defaultGroupRouteMode: 'shared' | 'personal'
 
     privateChatWithoutCommand: boolean
     allowAtReply: boolean
@@ -36,11 +48,7 @@ export interface Config {
     defaultChatMode: string
     defaultModel: string
     defaultPreset: string
-
-    autoCreateRoomFromUser: boolean
-
-    authUserDefaultGroup: Computed<Awaitable<[number, number, string]>>
-    authSystem: boolean
+    enablePresetKeywordTrigger: boolean
 
     voiceSpeakId: number
 
@@ -49,60 +57,110 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.intersect([
     Schema.object({
-        botName: Schema.string().default('香草'),
-        isNickname: Schema.boolean().default(true)
+        botNames: Schema.array(Schema.string()).default(['香草']),
+        isNickname: Schema.boolean().default(true),
+        isNickNameWithContent: Schema.boolean().default(false)
     }),
 
     Schema.object({
         allowPrivate: Schema.boolean().default(true),
         allowAtReply: Schema.boolean().default(true),
         allowQuoteReply: Schema.boolean().default(false),
-        isReplyWithAt: Schema.boolean().default(false),
-        isForwardMsg: Schema.boolean().default(false),
         privateChatWithoutCommand: Schema.boolean().default(true),
-        allowChatWithRoomName: Schema.boolean().default(false),
+        includeQuoteReply: Schema.boolean().default(true),
         randomReplyFrequency: Schema.percent()
             .min(0)
             .max(1)
             .step(0.01)
             .default(0)
+            .computed(),
+        attachForwardMsgIdToContext: Schema.boolean().default(false),
+        autoUpdateConversationModel: Schema.boolean().default(false)
     }),
+
+    Schema.intersect([
+        Schema.object({
+            isForwardMsg: Schema.boolean().default(false)
+        }),
+        Schema.union([
+            Schema.object({
+                isForwardMsg: Schema.const(true).required(),
+                forwardMsgMinLength: Schema.number()
+                    .min(0)
+                    .max(400)
+                    .step(1)
+                    .default(0)
+            }),
+            Schema.object({})
+        ])
+    ]),
+
+    Schema.intersect([
+        Schema.object({
+            isReplyWithAt: Schema.boolean().default(false)
+        }),
+        Schema.union([
+            Schema.object({
+                isReplyWithAt: Schema.const(true).required(),
+                replyQuoteThreshold: Schema.number()
+                    .min(0)
+                    .max(600)
+                    .step(1)
+                    .default(0)
+            }),
+            Schema.object({})
+        ])
+    ]),
 
     Schema.object({
         sendThinkingMessage: Schema.boolean().default(true),
         sendThinkingMessageTimeout: Schema.number().default(15000),
         msgCooldown: Schema.number().min(0).max(3600).step(1).default(0),
-        messageDelay: Schema.number()
+        messageQueue: Schema.boolean().default(true),
+        messageQueueDelay: Schema.number()
             .min(0)
-            .max(60 * Time.second)
-            .step(1)
+            .max(60 * 30)
             .default(0),
+        agentTaskAutoWakeup: Schema.boolean().default(true),
         showThoughtMessage: Schema.boolean().default(false)
     }),
 
     Schema.object({
         outputMode: Schema.dynamic('output-mode').default('text'),
-        splitMessage: Schema.boolean().default(false),
+        splitMessage: Schema.union([
+            Schema.const('none'),
+            Schema.const('punctuation'),
+            Schema.const('paragraph')
+        ]).default('none'),
         censor: Schema.boolean().default(false),
+        rawOnCensor: Schema.boolean().default(false),
         streamResponse: Schema.boolean().default(false)
     }),
 
     Schema.object({
-        blackList: Schema.union([Schema.boolean(), Schema.any().hidden()])
-            .role('computed')
-            .default(false)
+        blackList: Schema.number()
+            .min(0)
+            .max(1)
+            .step(1)
+            .default(0)
+            .computed()
+            .default(0)
     }),
 
     Schema.object({
-        messageCount: Schema.number()
-            .role('slider')
-            .min(2)
-            .max(100)
-            .step(1)
-            .default(40),
-        autoDelete: Schema.boolean().default(false),
-        autoDeleteTimeout: Schema.number()
+        infiniteContext: Schema.boolean().default(true),
+        infiniteContextThreshold: Schema.percent()
+            .min(0.5)
+            .max(0.95)
+            .step(0.01)
+            .default(0.85),
+        autoArchive: Schema.boolean().default(false),
+        autoArchiveTimeout: Schema.number()
             .default((Time.day * 10) / Time.second)
+            .min(Time.hour / Time.second),
+        autoPurgeArchive: Schema.boolean().default(false),
+        autoPurgeArchiveTimeout: Schema.number()
+            .default((Time.day * 30) / Time.second)
             .min(Time.hour / Time.second)
     }),
 
@@ -112,42 +170,32 @@ export const Config: Schema<Config> = Schema.intersect([
     }),
 
     Schema.object({
-        autoCreateRoomFromUser: Schema.boolean().default(false),
-        defaultChatMode: Schema.dynamic('chat-mode').default('chat'),
+        defaultGroupRouteMode: Schema.union([
+            Schema.const('shared'),
+            Schema.const('personal')
+        ]).default('shared'),
+        defaultChatMode: Schema.dynamic('chat-mode').default('plugin'),
         defaultModel: Schema.dynamic('model').default('无'),
-        defaultPreset: Schema.dynamic('preset').default('chatgpt')
+        defaultPreset: Schema.dynamic('preset').default('sydney'),
+        enablePresetKeywordTrigger: Schema.boolean().default(true)
     }),
 
     Schema.object({
-        authSystem: Schema.boolean().experimental().hidden().default(false),
-        isProxy: Schema.boolean().default(false),
         voiceSpeakId: Schema.number().default(0),
         isLog: Schema.boolean().default(false)
     }),
 
-    Schema.union([
+    Schema.intersect([
         Schema.object({
-            isProxy: Schema.const(true).required(),
-            proxyAddress: Schema.string().default('')
+            isProxy: Schema.boolean().default(false)
         }),
-        Schema.object({})
-    ]),
-
-    Schema.union([
-        Schema.object({
-            authSystem: Schema.const(true).required(),
-            authUserDefaultGroup: Schema.union([
-                Schema.tuple([
-                    Schema.number().default(0),
-                    Schema.number().default(1.0),
-                    Schema.string().default('guest')
-                ]),
-                Schema.any().hidden()
-            ])
-                .role('computed')
-                .default([0, 1.0, 'guest'])
-        }),
-        Schema.object({})
+        Schema.union([
+            Schema.object({
+                isProxy: Schema.const(true).required(),
+                proxyAddress: Schema.string().default('http://127.0.0.1:7897')
+            }),
+            Schema.object({})
+        ])
     ])
 ]).i18n({
     'zh-CN': require('./locales/zh-CN.schema'),

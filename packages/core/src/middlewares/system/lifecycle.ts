@@ -1,0 +1,66 @@
+import { Context } from 'koishi'
+import { Config } from '../../config'
+import { ChatChain } from '../../chains/chain'
+
+export function apply(ctx: Context, config: Config, chain: ChatChain) {
+    chain
+        .middleware('lifecycle-check', async (session, context) => 0)
+
+        .before('lifecycle-prepare')
+
+    chain
+        .middleware('lifecycle-prepare', async (session, context) => 0)
+        .after('lifecycle-check')
+        .before('lifecycle-handle_command')
+
+    chain
+        .middleware('lifecycle-handle_command', async (session, context) => 0)
+        .after('lifecycle-prepare')
+        .before('lifecycle-request_conversation')
+
+    chain
+        .middleware(
+            'lifecycle-request_conversation',
+            async (session, context) => 0
+        )
+        .after('lifecycle-handle_command')
+        .before('lifecycle-send')
+
+    chain
+        .middleware('lifecycle-send', async (session, context) => 0)
+        .after('lifecycle-request_conversation')
+}
+
+export const lifecycleNames = [
+    'lifecycle-check',
+    'lifecycle-prepare',
+    'lifecycle-handle_command',
+    'lifecycle-request_conversation',
+    'lifecycle-send'
+]
+
+declare module '../../chains/chain' {
+    export interface ChainMiddlewareName {
+        /**
+         * lifecycle of the middleware execution, it mean the check chain can continue to execute if the middleware return true
+         */
+        'lifecycle-check': never
+        /**
+         * lifecycle of the middleware execution, it mean the middleware will be prepare some data for the next middleware
+         */
+        'lifecycle-prepare': never
+        /**
+         * lifecycle of the middleware execution, it mean the middleware will be request to the model
+         */
+        'lifecycle-request_conversation': never
+        /**
+         * lifecycle of the middleware execution, it mean the middleware will be send message
+         */
+        'lifecycle-send': never
+
+        /**
+         * lifecycle of the middleware execution, it mean the middleware will be handle command
+         */
+        'lifecycle-handle_command': never
+    }
+}

@@ -1,64 +1,77 @@
-import { Context, Dict, sleep } from 'koishi'
+import { Awaitable, Context, Dict, Session } from 'koishi'
 import {
     BasePlatformClient,
     PlatformEmbeddingsClient,
     PlatformModelAndEmbeddingsClient,
-    PlatformModelClient
+    PlatformModelClient,
+    PlatformModelEmbeddingsAndRerankerClient,
+    PlatformRerankerClient
 } from 'koishi-plugin-chatluna/llm-core/platform/client'
-import {
-    ClientConfig,
-    ClientConfigPool
-} from 'koishi-plugin-chatluna/llm-core/platform/config'
 import {
     ChatLunaChainInfo,
     ChatLunaTool,
+    ChatLunaToolMeta,
     CreateChatLunaLLMChainParams,
+    CreateClientFunction,
+    CreateToolParams,
     CreateVectorStoreFunction,
     CreateVectorStoreParams,
     ModelInfo,
     ModelType,
-    PlatformClientNames
+    PlatformClientNames,
+    PlatformModelInfo
 } from 'koishi-plugin-chatluna/llm-core/platform/types'
 import { ChatLunaLLMChainWrapper } from '../chain/base'
 import { LRUCache } from 'lru-cache'
-import { ChatLunaSaveableVectorStore } from 'koishi-plugin-chatluna/llm-core/model/base'
-import { logger } from 'koishi-plugin-chatluna'
+import { ChatLunaSaveableVectorStore } from 'koishi-plugin-chatluna/llm-core/vectorstores'
+import { parseRawModelName } from 'koishi-plugin-chatluna/llm-core/utils/count_tokens'
+import { StructuredTool } from '@langchain/core/tools'
+import { computed, ComputedRef, markRaw, reactive } from '@vue/reactivity'
+import { randomUUID } from 'crypto'
+import { RunnableConfig } from '@langchain/core/runnables'
+import { ToolMask } from '../agent'
+import type { ConversationRecord } from '../../types'
 
 export class PlatformService {
-    private _platformClients: Record<string, BasePlatformClient> = {}
-    private _createClientFunctions: Record<
-        string,
-        (ctx: Context, config: ClientConfig) => BasePlatformClient
-    > = {}
+    private _platformClients: Record<string, BasePlatformClient> = reactive({})
+    private _createClientFunctions: Record<string, CreateClientFunction> =
+        reactive({})
 
-    private _configPools: Record<string, ClientConfigPool> = {}
-    private _tools: Record<string, ChatLunaTool> = {}
-    private _models: Record<string, ModelInfo[]> = {}
-    private _chatChains: Record<string, ChatLunaChainInfo> = {}
-    private _vectorStore: Record<string, CreateVectorStoreFunction> = {}
+    private _tools: Record<string, ChatLunaTool> = reactive({})
+    private _tmpTools: Record<string, StructuredTool> = {}
+    private _toolMaskResolvers: Record<string, ToolMaskResolver> = {}
+    private _models: Record<string, ModelInfo[]> = reactive({})
+    private _chatChains: Record<string, ChatLunaChainInfo> = reactive({})
+    private _vectorStore: Record<string, CreateVectorStoreFunction> = reactive(
+        {}
+    )
 
     private _tmpVectorStores = new LRUCache<
         string,
         ChatLunaSaveableVectorStore
     >({
         max: 20,
-        dispose: (value, key, reason) => {
-            value.free()
+        dispose: (value) => {
+            value.free?.()
         }
     })
 
     constructor(private ctx: Context) {
-        this.ctx.on('chatluna/clear-chat-history', async (conversationId) => {
-            this._tmpVectorStores.clear()
-        })
+        const clear = async (payload: { conversation: { id: string } }) => {
+            this._tmpVectorStores.delete(payload.conversation.id)
+        }
+
+        this.ctx.on('chatluna/after-conversation-clear-history', clear)
+        this.ctx.on('chatluna/after-conversation-cache-clear', clear)
+        this.ctx.on('chatluna/after-conversation-archive', clear)
+        this.ctx.on('chatluna/after-conversation-restore', clear)
+        this.ctx.on('chatluna/after-conversation-delete', clear)
+        this.ctx.on('chatluna/conversation-compressed', clear)
     }
 
     registerClient(
         name: PlatformClientNames,
-        createClientFunction: (
-            ctx: Context,
-            config: ClientConfig
-        ) => BasePlatformClient
+        createClientFunction: CreateClientFunction
     ) {
         if (this._createClientFunctions[name]) {
             throw new Error(`Client ${name} already exists`)
@@ -67,67 +80,48 @@ export class PlatformService {
         return () => this.unregisterClient(name)
     }
 
-    registerConfigPool(name: string, configPool: ClientConfigPool) {
-        if (this._configPools[name]) {
-            throw new Error(`Config pool ${name} already exists`)
-        }
-        this._configPools[name] = configPool
-    }
-
     registerTool(name: string, toolCreator: ChatLunaTool) {
-        this._tools[name] = toolCreator
+        toolCreator.id = randomUUID()
+        toolCreator.name = name
+        this._tools[name] = markRaw(toolCreator)
+        delete this._tmpTools[name]
         this.ctx.emit('chatluna/tool-updated', this)
         return () => this.unregisterTool(name)
     }
 
     unregisterTool(name: string) {
         delete this._tools[name]
+        delete this._tmpTools[name]
         this.ctx.emit('chatluna/tool-updated', this)
     }
 
     unregisterClient(platform: PlatformClientNames) {
-        const configPool = this._configPools[platform]
-
-        if (!configPool) {
-            throw new Error(`Config pool ${platform} not found`)
-        }
-
-        const configs = configPool.getConfigs()
-
         delete this._models[platform]
 
-        for (const config of configs) {
-            const client = this.getClientForCache(config.value)
+        const client = this._platformClients[platform]
 
-            if (client == null) {
-                continue
-            }
-
-            delete this._platformClients[
-                this._getClientConfigAsKey(config.value)
-            ]
-
-            if (client instanceof PlatformModelClient) {
-                this.ctx.emit('chatluna/model-removed', this, platform, client)
-            } else if (client instanceof PlatformEmbeddingsClient) {
-                this.ctx.emit(
-                    'chatluna/embeddings-removed',
-                    this,
-                    platform,
-                    client
-                )
-            } else if (client instanceof PlatformModelAndEmbeddingsClient) {
-                this.ctx.emit(
-                    'chatluna/embeddings-removed',
-                    this,
-                    platform,
-                    client
-                )
-                this.ctx.emit('chatluna/model-removed', this, platform, client)
-            }
+        if (client == null) {
+            delete this._createClientFunctions[platform]
+            return
         }
 
-        delete this._configPools[platform]
+        delete this._platformClients[platform]
+
+        if (client instanceof PlatformModelEmbeddingsAndRerankerClient) {
+            this.ctx.emit('chatluna/embeddings-removed', this, platform, client)
+            this.ctx.emit('chatluna/model-removed', this, platform, client)
+            this.ctx.emit('chatluna/reranker-removed', this, platform, client)
+        } else if (client instanceof PlatformModelAndEmbeddingsClient) {
+            this.ctx.emit('chatluna/embeddings-removed', this, platform, client)
+            this.ctx.emit('chatluna/model-removed', this, platform, client)
+        } else if (client instanceof PlatformModelClient) {
+            this.ctx.emit('chatluna/model-removed', this, platform, client)
+        } else if (client instanceof PlatformEmbeddingsClient) {
+            this.ctx.emit('chatluna/embeddings-removed', this, platform, client)
+        } else if (client instanceof PlatformRerankerClient) {
+            this.ctx.emit('chatluna/reranker-removed', this, platform, client)
+        }
+
         delete this._createClientFunctions[platform]
     }
 
@@ -150,7 +144,7 @@ export class PlatformService {
         description: Dict<string>,
         createChatChainFunction: (
             params: CreateChatLunaLLMChainParams
-        ) => Promise<ChatLunaLLMChainWrapper>
+        ) => ChatLunaLLMChainWrapper
     ) {
         this._chatChains[name] = {
             name,
@@ -167,76 +161,149 @@ export class PlatformService {
         this.ctx.emit('chatluna/chat-chain-removed', this, chain)
     }
 
-    getModels(platform: PlatformClientNames, type: ModelType) {
-        const models = this._models[platform] ?? []
+    listPlatformModels(platform: PlatformClientNames, type: ModelType) {
+        return computed(() => {
+            const models = this._models[platform] ?? []
 
-        if (models.length === 0) {
-            return []
+            if (models.length === 0) {
+                return [] as ModelInfo[]
+            }
+
+            return models
+                .filter((m) => type === ModelType.all || m.type === type)
+                .sort((a, b) => {
+                    if (!a?.name || !b?.name) return 0
+                    return a.name.localeCompare(b.name, undefined, {
+                        numeric: true,
+                        sensitivity: 'base'
+                    })
+                })
+        })
+    }
+
+    findModel(fullModelName: string): ComputedRef<ModelInfo | null>
+    findModel(platform: string, name: string): ComputedRef<ModelInfo | null>
+
+    findModel(platform: string, name?: string): ComputedRef<ModelInfo | null> {
+        if (name == null) {
+            ;[platform, name] = parseRawModelName(platform)
         }
 
-        return models
-            .filter((m) => type === ModelType.all || m.type === type)
-            .sort((a, b) => {
-                if (!a?.name || !b?.name) return 0
-                return a.name.localeCompare(b.name, undefined, {
-                    numeric: true,
-                    sensitivity: 'base'
-                })
-            })
+        return computed(
+            () => this._models[platform]?.find((m) => m.name === name) ?? null
+        )
     }
 
     getTools() {
-        return Object.keys(this._tools)
+        return computed(() => Object.keys(this._tools))
     }
 
-    getConfigs(platform: string) {
-        return this._configPools[platform]?.getConfigs() ?? []
-    }
-
-    resolveModel(platform: PlatformClientNames, name: string) {
-        return this._models[platform]?.find((m) => m.name === name)
-    }
-
-    getAllModels(type: ModelType) {
-        const allModel: string[] = []
-
-        for (const platform in this._models) {
-            const models = this._models[platform]
-
-            for (const model of models) {
-                if (type === ModelType.all || model.type === type) {
-                    allModel.push(platform + '/' + model.name)
+    getToolRegistry(): Record<
+        string,
+        { name: string; description?: string; meta?: ChatLunaToolMeta }
+    > {
+        return Object.fromEntries(
+            Object.entries(this._tools).map(([name, tool]) => [
+                name,
+                {
+                    name,
+                    description: tool.description,
+                    meta: tool.meta
                 }
+            ])
+        )
+    }
+
+    getFilteredTools(mask: ToolMask) {
+        const allNames = Object.keys(this._tools)
+        const names = mask.tools
+            ? allNames.filter((name) => mask.tools.includes(name))
+            : allNames
+
+        if (mask.mode === 'all') {
+            return names
+        }
+
+        if (mask.mode === 'allow') {
+            return names.filter((name) => mask.allow.includes(name))
+        }
+
+        return names.filter((name) => !mask.deny.includes(name))
+    }
+
+    registerToolMaskResolver(name: string, resolver: ToolMaskResolver) {
+        this._toolMaskResolvers[name] = resolver
+
+        return () => {
+            delete this._toolMaskResolvers[name]
+        }
+    }
+
+    async resolveToolMask(arg: ToolMaskArg) {
+        for (const name in this._toolMaskResolvers) {
+            const mask = await this._toolMaskResolvers[name](arg)
+            if (mask) {
+                return mask
+            }
+        }
+    }
+
+    static buildToolMask(rule: {
+        mode?: 'inherit' | 'all' | 'allow' | 'deny'
+        allow?: string[]
+        deny?: string[]
+    }): ToolMask {
+        if (rule.mode === 'allow') {
+            return {
+                mode: 'allow',
+                allow: rule.allow ?? [],
+                deny: []
             }
         }
 
-        return allModel.sort()
-    }
-
-    getVectorStores() {
-        return Object.keys(this._vectorStore)
-    }
-
-    /**
-     * @deprecated Use {@link getVectorStores} instead. Will be removed in the next version.
-     */
-    getVectorStoreRetrievers() {
-        return Object.values(this._vectorStore)
-    }
-
-    getChatChains() {
-        return Object.values(this._chatChains)
-    }
-
-    makeConfigStatus(config: ClientConfig, isAvailable: boolean) {
-        const platform = config.platform
-        const pool = this._configPools[platform]
-
-        if (!pool) {
-            throw new Error(`Config pool ${platform} not found`)
+        if (rule.mode === 'deny') {
+            return {
+                mode: 'deny',
+                allow: [],
+                deny: rule.deny ?? []
+            }
         }
 
-        return pool.markConfigStatus(config, isAvailable)
+        return {
+            mode: 'all',
+            allow: [],
+            deny: []
+        }
+    }
+
+    listAllModels(type: ModelType) {
+        return computed(() => {
+            const allModel: PlatformModelInfo[] = []
+
+            for (const platform in this._models) {
+                const models = this._models[platform]
+
+                for (const model of models) {
+                    if (type === ModelType.all || model.type === type) {
+                        allModel.push({
+                            ...model,
+                            platform,
+                            toModelName: () => platform + '/' + model.name
+                        })
+                    }
+                }
+            }
+
+            return allModel.sort()
+        })
+    }
+
+    get vectorStores() {
+        return computed(() => Object.keys(this._vectorStore))
+    }
+
+    get chatChains() {
+        return computed(() => Object.values(this._chatChains))
     }
 
     async createVectorStore(name: string, params: CreateVectorStoreParams) {
@@ -264,70 +331,33 @@ export class PlatformService {
         return vectorStore
     }
 
-    async randomConfig(platform: string, lockConfig: boolean = false) {
-        return this._configPools[platform]?.getConfig(lockConfig)
-    }
-
-    async randomClient(platform: string, lockConfig: boolean = false) {
-        const config = await this.randomConfig(platform, lockConfig)
-
-        if (!config) {
-            return undefined
+    async getClient(platform: string) {
+        if (!this._platformClients[platform]) {
+            await this.createClient(platform)
         }
 
-        const client = await this.getClient(config.value)
-
-        return client
-    }
-
-    getClientForCache(config: ClientConfig) {
-        return this._platformClients[this._getClientConfigAsKey(config)]
-    }
-
-    async getClient(config: ClientConfig) {
-        return (
-            this.getClientForCache(config) ??
-            (await this.createClient(config.platform, config))
-        )
+        return computed(() => this._platformClients[platform])
     }
 
     async refreshClient(
         client: BasePlatformClient,
         platform: string,
-        config: ClientConfig
+        config?: RunnableConfig
     ) {
-        let isAvailable = false
-
-        try {
-            isAvailable = await client.isAvailable()
-        } catch (e) {
-            logger.error(e)
-        }
-
-        const pool = this._configPools[platform]
-
-        await pool.markConfigStatus(config, isAvailable)
+        const isAvailable = await client.isAvailable(config)
 
         if (!isAvailable) {
-            return undefined
+            return
         }
 
-        let models: ModelInfo[] | null = null
-        try {
-            models = await client.getModels()
-        } catch (e) {
-            logger.error(e)
-        }
+        const models = await client.getModels(config)
 
         if (models == null) {
-            await pool.markConfigStatus(config, false)
-
-            return undefined
+            return
         }
 
         const availableModels = this._models[platform] ?? []
 
-        await sleep(1)
         // filter existing models
         this._models[platform] = availableModels.concat(
             models.filter(
@@ -335,58 +365,68 @@ export class PlatformService {
             )
         )
 
-        if (client instanceof PlatformModelClient) {
-            this.ctx.emit('chatluna/model-added', this, platform, client)
-        } else if (client instanceof PlatformEmbeddingsClient) {
+        if (client instanceof PlatformModelEmbeddingsAndRerankerClient) {
             this.ctx.emit('chatluna/embeddings-added', this, platform, client)
+            this.ctx.emit('chatluna/model-added', this, platform, client)
+            this.ctx.emit('chatluna/reranker-added', this, platform, client)
         } else if (client instanceof PlatformModelAndEmbeddingsClient) {
             this.ctx.emit('chatluna/embeddings-added', this, platform, client)
             this.ctx.emit('chatluna/model-added', this, platform, client)
+        } else if (client instanceof PlatformModelClient) {
+            this.ctx.emit('chatluna/model-added', this, platform, client)
+        } else if (client instanceof PlatformEmbeddingsClient) {
+            this.ctx.emit('chatluna/embeddings-added', this, platform, client)
+        } else if (client instanceof PlatformRerankerClient) {
+            this.ctx.emit('chatluna/reranker-added', this, platform, client)
         }
     }
 
-    async createClient(platform: string, config: ClientConfig) {
+    async createClient(platform: string, config?: RunnableConfig) {
         const createClientFunction = this._createClientFunctions[platform]
 
         if (!createClientFunction) {
-            throw new Error(`Create client function ${platform} not found`)
+            return
         }
 
-        const client = createClientFunction(this.ctx, config)
+        if (this._platformClients[platform]) {
+            this.ctx.logger.warn(
+                `Client ${platform} already exists, skip creating`
+            )
+            return this._platformClients[platform]
+        }
+
+        const client = createClientFunction()
 
         await this.refreshClient(client, platform, config)
+
+        this._platformClients[platform] = markRaw(client)
 
         return client
     }
 
-    async createClients(platform: string) {
-        const configPool = this._configPools[platform]
-
-        if (!configPool) {
-            throw new Error(`Config pool ${platform} not found`)
-        }
-
-        const configs = configPool.getConfigs()
-
-        const clients: BasePlatformClient[] = []
-
-        for (const config of configs) {
-            const client = await this.createClient(platform, config.value)
-
-            if (client == null) {
-                continue
+    getTool(name: string) {
+        const tool = this._tools[name]
+        // eslint-disable-next-line @typescript-eslint/no-this-alias
+        const that = this
+        return {
+            ...tool,
+            createTool(params) {
+                return that._createTool(name, params)
             }
-
-            clients.push(client)
-            this._platformClients[this._getClientConfigAsKey(config.value)] =
-                client
-        }
-
-        return clients
+        } satisfies ChatLunaTool
     }
 
-    getTool(name: string) {
-        return this._tools[name]
+    private _createTool(name: string, params: CreateToolParams) {
+        if (this._tmpTools[name]) {
+            return this._tmpTools[name]
+        }
+        const chatLunaTool = this._tools[name]
+        if (chatLunaTool == null) {
+            throw new Error(`Tool ${name} not found`)
+        }
+        const tool = chatLunaTool.createTool(params)
+        this._tmpTools[name] = markRaw(tool)
+        return tool
     }
 
     createChatChain(name: string, params: CreateChatLunaLLMChainParams) {
@@ -399,12 +439,13 @@ export class PlatformService {
         return chatChain.createFunction(params)
     }
 
-    private _getClientConfigAsKey(config: ClientConfig) {
-        return `${config.platform}/${config.apiKey}/${config.apiEndpoint}/${config.maxRetries}/${config.concurrentMaxSize}/${config.timeout}`
-    }
-
     dispose() {
         this._tmpVectorStores.clear()
+        this._platformClients = reactive({})
+        this._models = reactive({})
+        this._tools = reactive({})
+        this._tmpTools = {}
+        this._chatChains = reactive({})
     }
 }
 
@@ -446,6 +487,27 @@ declare module 'koishi' {
             platform: PlatformClientNames,
             client: BasePlatformClient | BasePlatformClient[]
         ) => void
+        'chatluna/reranker-added': (
+            service: PlatformService,
+            platform: PlatformClientNames,
+            client: BasePlatformClient | BasePlatformClient[]
+        ) => void
+        'chatluna/reranker-removed': (
+            service: PlatformService,
+            platform: PlatformClientNames,
+            client: BasePlatformClient
+        ) => void
         'chatluna/tool-updated': (service: PlatformService) => void
     }
 }
+
+export interface ToolMaskArg {
+    session: Session
+    conversation?: ConversationRecord
+    bindingKey?: string
+    source?: string
+}
+
+export type ToolMaskResolver = (
+    arg: ToolMaskArg
+) => Awaitable<ToolMask | undefined>
